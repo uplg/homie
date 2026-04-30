@@ -22,13 +22,14 @@ url = "2.5.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 dotenvy = "0.15.7"
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-aac", "symphonia-isomp4"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-aac", "symphonia-isomp4", "symphonia-vorbis", "symphonia-ogg", "symphonia-flac", "symphonia-wav"] }
 cpal = "0.17.1"
 # Upstream yt-dlp 2.7.2 on crates.io transitively pins lofty 0.23.x, which has
 # been entirely yanked. The Guilherme-j10 fork carries the lofty bump on its
 # `develop` branch. Drop this git override the day a fixed version lands on
 # crates.io.
 yt-dlp = { git = "https://github.com/Guilherme-j10/yt-dlp", branch = "develop" }
+obws = { version = "0.15.0", default-features = false }
 
 [dev-dependencies]
 wiremock = "0.6.5"

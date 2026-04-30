@@ -8,6 +8,7 @@ use twitchy::{
     config::AppConfig,
     error::Error,
     maison::MaisonClient,
+    obs::ObsRestarter,
     twitch::{
         auth::{self, DevicePrompt},
         eventsub::{self, EventSubContext},
@@ -93,6 +94,18 @@ async fn run() -> Result<()> {
     };
     let yt = Arc::new(YtQueue::start(yt_cache, yt_cfg).await);
 
+    let obs = cfg.env.obs.clone().map(ObsRestarter::new);
+    if let Some(restarter) = obs.as_ref() {
+        tracing::info!("OBS WebSocket configured; !screen command enabled");
+        if restarter.spawn_monitor().is_some() {
+            tracing::info!("OBS capture-freeze monitor enabled");
+        }
+    }
+    let club_url = cfg.env.club_url.clone().map(Arc::new);
+    if club_url.is_some() {
+        tracing::info!("!club command enabled");
+    }
+
     let ctx = EventSubContext {
         helix,
         token: token.clone(),
@@ -100,6 +113,8 @@ async fn run() -> Result<()> {
         rewards: Arc::new(cfg.rewards.clone()),
         maison: maison.clone(),
         yt: yt.clone(),
+        obs,
+        club_url,
         state: Arc::new(tokio::sync::Mutex::new(eventsub::EventSubState::default())),
     };
 

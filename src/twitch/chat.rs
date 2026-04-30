@@ -19,6 +19,7 @@ use crate::{
     config::{Matcher, RewardsConfig, Rule},
     error::{Error, Result},
     maison::MaisonClient,
+    obs::ObsRestarter,
     yt_queue::{EnqueueOutcome, YtQueue},
 };
 
@@ -29,6 +30,8 @@ pub const YT_BUILTIN: &str = "!yt";
 pub const QUEUE_BUILTIN: &str = "!queue";
 pub const VOLUME_BUILTIN: &str = "!volume";
 pub const SKIP_BUILTIN: &str = "!skip";
+pub const CLUB_BUILTIN: &str = "!club";
+pub const SCREEN_BUILTIN: &str = "!screen";
 
 /// Extract a `!command` from the start of a chat line.
 ///
@@ -68,10 +71,45 @@ pub fn is_admin(badges: &[Badge]) -> bool {
 
 /// Built-ins that are always available, in display order.
 const PUBLIC_BUILTINS: &[&str] = &[COMMANDS_BUILTIN, YT_BUILTIN, QUEUE_BUILTIN];
-const ADMIN_BUILTINS: &[&str] = &[VOLUME_BUILTIN, SKIP_BUILTIN];
+const ADMIN_BUILTINS: &[&str] = &[VOLUME_BUILTIN, SKIP_BUILTIN, SCREEN_BUILTIN];
 
 fn is_builtin(command: &str) -> bool {
+    if command == CLUB_BUILTIN {
+        // !club only exists when an URL has been configured; the dispatcher
+        // checks ChatDeps before treating it as a built-in.
+        return false;
+    }
     PUBLIC_BUILTINS.contains(&command) || ADMIN_BUILTINS.contains(&command)
+}
+
+/// Runtime dependencies the chat dispatcher needs.
+#[derive(Clone)]
+pub struct ChatDeps {
+    pub helix: HelixClient<'static, reqwest::Client>,
+    pub token: Arc<UserToken>,
+    pub rewards: Arc<RewardsConfig>,
+    pub maison: Arc<MaisonClient>,
+    pub yt: Arc<YtQueue>,
+    pub obs: Option<Arc<ObsRestarter>>,
+    pub club_url: Option<Arc<String>>,
+}
+
+/// Minimal flags driving optional built-ins in the `!commands` listing.
+/// Exposed separately from `ChatDeps` so it stays trivially constructible
+/// from tests (no Helix/Twitch token / Maison client needed).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BuiltinFlags {
+    pub club_enabled: bool,
+    pub screen_enabled: bool,
+}
+
+impl BuiltinFlags {
+    fn from_deps(deps: &ChatDeps) -> Self {
+        Self {
+            club_enabled: deps.club_url.is_some(),
+            screen_enabled: deps.obs.is_some(),
+        }
+    }
 }
 
 /// Build the reply for the built-in `!commands` listing.
@@ -80,13 +118,23 @@ fn is_builtin(command: &str) -> bool {
 /// `rewards`, split between public and admin-only. User rules whose name
 /// collides with a built-in are dropped (built-ins always win).
 #[must_use]
-pub fn format_commands_list(rewards: &RewardsConfig) -> String {
+pub fn format_commands_list(rewards: &RewardsConfig, flags: BuiltinFlags) -> String {
     let mut public: Vec<&str> = PUBLIC_BUILTINS.to_vec();
     let mut admin: Vec<&str> = ADMIN_BUILTINS.to_vec();
 
+    if flags.club_enabled {
+        public.push(CLUB_BUILTIN);
+    }
+    if !flags.screen_enabled {
+        admin.retain(|c| *c != SCREEN_BUILTIN);
+    }
+
     for rule in &rewards.rules {
         if let Matcher::ChatCommand { chat_command } = &rule.matcher {
-            if is_builtin(chat_command) {
+            if is_builtin(chat_command)
+                || chat_command == CLUB_BUILTIN
+                || chat_command == SCREEN_BUILTIN
+            {
                 continue;
             }
             if rule.admin_only {
@@ -106,24 +154,22 @@ pub fn format_commands_list(rewards: &RewardsConfig) -> String {
 }
 
 /// Process a single chat message: parse → match → execute → reply.
-pub async fn dispatch(
-    payload: &ChannelChatMessageV1Payload,
-    rewards: &RewardsConfig,
-    maison: &Arc<MaisonClient>,
-    helix: &HelixClient<'static, reqwest::Client>,
-    token: &UserToken,
-    yt: &Arc<YtQueue>,
-) -> Result<()> {
+pub async fn dispatch(payload: &ChannelChatMessageV1Payload, deps: &ChatDeps) -> Result<()> {
     let Some((command, args)) = parse_command_with_args(&payload.message.text) else {
         return Ok(());
     };
 
-    // Built-ins are intercepted before the user-rule lookup so they always work.
-    if is_builtin(command) {
-        return handle_builtin(command, args, payload, rewards, helix, token, yt).await;
+    // !club is only a built-in when configured; otherwise fall through to
+    // the user-defined rules so it can be customised in rewards.toml.
+    let club_active = command == CLUB_BUILTIN && deps.club_url.is_some();
+    // !screen likewise depends on OBS being configured.
+    let screen_active = command == SCREEN_BUILTIN && deps.obs.is_some();
+
+    if is_builtin(command) || club_active || screen_active {
+        return handle_builtin(command, args, payload, deps).await;
     }
 
-    let Some(rule) = actions::rule_for_chat_command(rewards, command) else {
+    let Some(rule) = actions::rule_for_chat_command(&deps.rewards, command) else {
         tracing::trace!(command = %command, "no rule matches this chat command");
         return Ok(());
     };
@@ -137,18 +183,24 @@ pub async fn dispatch(
         return Ok(());
     }
 
-    match actions::execute(rule, maison).await {
+    match actions::execute(rule, &deps.maison).await {
         Ok(message) => {
             tracing::info!(command = %command, %message, "chat command executed");
             if let Some(reply) = effective_reply(rule, &message) {
-                send_message(helix, token, &payload.broadcaster_user_id, reply).await?;
+                send_message(
+                    &deps.helix,
+                    &deps.token,
+                    &payload.broadcaster_user_id,
+                    reply,
+                )
+                .await?;
             }
         }
         Err(err) => {
             tracing::error!(command = %command, error = %err, "chat command failed");
             send_message(
-                helix,
-                token,
+                &deps.helix,
+                &deps.token,
                 &payload.broadcaster_user_id,
                 &format!("⚠ error: {err}"),
             )
@@ -168,41 +220,61 @@ fn effective_reply<'a>(rule: &'a Rule, fallback: &'a str) -> Option<&'a str> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_builtin(
     command: &str,
     args: &str,
     payload: &ChannelChatMessageV1Payload,
-    rewards: &RewardsConfig,
-    helix: &HelixClient<'static, reqwest::Client>,
-    token: &UserToken,
-    yt: &Arc<YtQueue>,
+    deps: &ChatDeps,
 ) -> Result<()> {
     match command {
         COMMANDS_BUILTIN => {
-            let listing = format_commands_list(rewards);
-            send_message(helix, token, &payload.broadcaster_user_id, &listing).await
+            let listing = format_commands_list(&deps.rewards, BuiltinFlags::from_deps(deps));
+            send_message(
+                &deps.helix,
+                &deps.token,
+                &payload.broadcaster_user_id,
+                &listing,
+            )
+            .await
         }
-        YT_BUILTIN => handle_yt(args, payload, helix, token, yt).await,
-        QUEUE_BUILTIN => handle_queue(payload, helix, token, yt).await,
+        YT_BUILTIN => handle_yt(args, payload, deps).await,
+        QUEUE_BUILTIN => handle_queue(payload, deps).await,
+        CLUB_BUILTIN => {
+            let Some(url) = deps.club_url.as_ref() else {
+                return Ok(());
+            };
+            send_message(
+                &deps.helix,
+                &deps.token,
+                &payload.broadcaster_user_id,
+                url.as_str(),
+            )
+            .await
+        }
         VOLUME_BUILTIN => {
             if !is_admin(&payload.badges) {
                 return Ok(());
             }
-            handle_volume(args, payload, helix, token, yt).await
+            handle_volume(args, payload, deps).await
         }
         SKIP_BUILTIN => {
             if !is_admin(&payload.badges) {
                 return Ok(());
             }
-            yt.skip();
+            deps.yt.skip();
             send_message(
-                helix,
-                token,
+                &deps.helix,
+                &deps.token,
                 &payload.broadcaster_user_id,
                 "Skipping current track",
             )
             .await
+        }
+        SCREEN_BUILTIN => {
+            if !is_admin(&payload.badges) {
+                return Ok(());
+            }
+            handle_screen(payload, deps).await
         }
         _ => Ok(()),
     }
@@ -211,21 +283,22 @@ async fn handle_builtin(
 async fn handle_yt(
     args: &str,
     payload: &ChannelChatMessageV1Payload,
-    helix: &HelixClient<'static, reqwest::Client>,
-    token: &UserToken,
-    yt: &Arc<YtQueue>,
+    deps: &ChatDeps,
 ) -> Result<()> {
     let url = args.split_whitespace().next().unwrap_or("");
     if url.is_empty() {
         return send_message(
-            helix,
-            token,
+            &deps.helix,
+            &deps.token,
             &payload.broadcaster_user_id,
             "Usage: !yt <YouTube URL>",
         )
         .await;
     }
-    let outcome = yt.enqueue(url, payload.chatter_user_login.as_str()).await;
+    let outcome = deps
+        .yt
+        .enqueue(url, payload.chatter_user_login.as_str())
+        .await;
     let reply = match outcome {
         EnqueueOutcome::StartingNow { title } => format!("Now playing: {title}"),
         EnqueueOutcome::Queued { title, position } => {
@@ -233,16 +306,17 @@ async fn handle_yt(
         }
         EnqueueOutcome::Rejected(reason) => format!("⚠ {reason}"),
     };
-    send_message(helix, token, &payload.broadcaster_user_id, &reply).await
+    send_message(
+        &deps.helix,
+        &deps.token,
+        &payload.broadcaster_user_id,
+        &reply,
+    )
+    .await
 }
 
-async fn handle_queue(
-    payload: &ChannelChatMessageV1Payload,
-    helix: &HelixClient<'static, reqwest::Client>,
-    token: &UserToken,
-    yt: &Arc<YtQueue>,
-) -> Result<()> {
-    let state = yt.snapshot().await;
+async fn handle_queue(payload: &ChannelChatMessageV1Payload, deps: &ChatDeps) -> Result<()> {
+    let state = deps.yt.snapshot().await;
     let mut parts = Vec::new();
     if let Some(current) = state.current.as_ref() {
         parts.push(format!("Now: {} ({})", current.title, current.requested_by));
@@ -267,22 +341,26 @@ async fn handle_queue(
     } else {
         parts.join(" || ")
     };
-    send_message(helix, token, &payload.broadcaster_user_id, &reply).await
+    send_message(
+        &deps.helix,
+        &deps.token,
+        &payload.broadcaster_user_id,
+        &reply,
+    )
+    .await
 }
 
 async fn handle_volume(
     args: &str,
     payload: &ChannelChatMessageV1Payload,
-    helix: &HelixClient<'static, reqwest::Client>,
-    token: &UserToken,
-    yt: &Arc<YtQueue>,
+    deps: &ChatDeps,
 ) -> Result<()> {
     let arg = args.split_whitespace().next().unwrap_or("");
     if arg.is_empty() {
-        let current = yt.snapshot().await.volume_percent;
+        let current = deps.yt.snapshot().await.volume_percent;
         return send_message(
-            helix,
-            token,
+            &deps.helix,
+            &deps.token,
             &payload.broadcaster_user_id,
             &format!("Volume: {current}% (use `!volume <0-100>` to change)"),
         )
@@ -293,20 +371,40 @@ async fn handle_volume(
         Ok(value) if value <= 100 => value,
         _ => {
             return send_message(
-                helix,
-                token,
+                &deps.helix,
+                &deps.token,
                 &payload.broadcaster_user_id,
                 "Usage: !volume <0-100>",
             )
             .await;
         }
     };
-    let applied = yt.set_volume(percent);
+    let applied = deps.yt.set_volume(percent);
     send_message(
-        helix,
-        token,
+        &deps.helix,
+        &deps.token,
         &payload.broadcaster_user_id,
         &format!("Volume set to {applied}%"),
+    )
+    .await
+}
+
+async fn handle_screen(payload: &ChannelChatMessageV1Payload, deps: &ChatDeps) -> Result<()> {
+    let Some(obs) = deps.obs.as_ref() else {
+        return Ok(());
+    };
+    let reply = match obs.restart_all().await {
+        Ok(report) => format!("OBS: {report}"),
+        Err(err) => {
+            tracing::error!(error = %err, "OBS restart failed");
+            format!("⚠ OBS: {err}")
+        }
+    };
+    send_message(
+        &deps.helix,
+        &deps.token,
+        &payload.broadcaster_user_id,
+        &reply,
     )
     .await
 }
@@ -363,7 +461,10 @@ mod tests {
     #[test]
     fn format_commands_list_empty_config_only_builtins() {
         let cfg = RewardsConfig::parse("").unwrap();
-        assert_eq!(format_commands_list(&cfg), BUILTINS_ONLY);
+        assert_eq!(
+            format_commands_list(&cfg, BuiltinFlags::default()),
+            BUILTINS_ONLY
+        );
     }
 
     #[test]
@@ -391,7 +492,7 @@ mod tests {
         )
         .unwrap();
 
-        let listing = format_commands_list(&cfg);
+        let listing = format_commands_list(&cfg, BuiltinFlags::default());
         assert_eq!(
             listing,
             "Commands: !commands, !yt, !queue, !lamp_on, !feed_apollo \
@@ -415,7 +516,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            format_commands_list(&cfg),
+            format_commands_list(&cfg, BuiltinFlags::default()),
             "Commands: !commands, !yt, !queue, !lamp_on | Admin only: !volume, !skip"
         );
     }
@@ -437,7 +538,23 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(format_commands_list(&cfg), BUILTINS_ONLY);
+        assert_eq!(
+            format_commands_list(&cfg, BuiltinFlags::default()),
+            BUILTINS_ONLY
+        );
+    }
+
+    #[test]
+    fn format_commands_list_includes_club_and_screen_when_enabled() {
+        let cfg = RewardsConfig::parse("").unwrap();
+        let flags = BuiltinFlags {
+            club_enabled: true,
+            screen_enabled: true,
+        };
+        assert_eq!(
+            format_commands_list(&cfg, flags),
+            "Commands: !commands, !yt, !queue, !club | Admin only: !volume, !skip, !screen"
+        );
     }
 
     #[test]

@@ -82,6 +82,8 @@ pub struct EventSubContext {
     pub rewards: Arc<RewardsConfig>,
     pub maison: Arc<MaisonClient>,
     pub yt: Arc<YtQueue>,
+    pub obs: Option<Arc<crate::obs::ObsRestarter>>,
+    pub club_url: Option<Arc<String>>,
     pub state: Arc<Mutex<EventSubState>>,
 }
 
@@ -282,11 +284,15 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                 }
                 return chat::dispatch(
                     &message,
-                    &ctx.rewards,
-                    &ctx.maison,
-                    &ctx.helix,
-                    ctx.token.as_ref(),
-                    &ctx.yt,
+                    &chat::ChatDeps {
+                        helix: ctx.helix.clone(),
+                        token: ctx.token.clone(),
+                        rewards: ctx.rewards.clone(),
+                        maison: ctx.maison.clone(),
+                        yt: ctx.yt.clone(),
+                        obs: ctx.obs.clone(),
+                        club_url: ctx.club_url.clone(),
+                    },
                 )
                 .await;
             }

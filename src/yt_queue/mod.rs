@@ -67,6 +67,9 @@ pub struct Track {
     pub title: String,
     pub duration_secs: u32,
     pub requested_by: String,
+    /// When `true`, the worker downloads the URL verbatim with reqwest
+    /// instead of shelling out to yt-dlp.
+    pub is_direct: bool,
 }
 
 /// Public, lockless-read view of the queue.
@@ -152,7 +155,11 @@ impl YtQueue {
 
     /// Probe a URL and push to the queue. Returns the user-facing outcome.
     pub async fn enqueue(&self, url: &str, requested_by: &str) -> EnqueueOutcome {
-        if !self.available.load(Ordering::Relaxed) {
+        let direct = download::is_direct_audio_url(url).is_some();
+
+        // yt-dlp is only required for non-direct URLs (YouTube etc.). A
+        // missing yt-dlp installation must not block direct mp3/ogg/... links.
+        if !direct && !self.available.load(Ordering::Relaxed) {
             return EnqueueOutcome::Rejected(
                 "yt-dlp is not installed on the bot host (brew install yt-dlp)".to_string(),
             );
@@ -166,20 +173,41 @@ impl YtQueue {
             ));
         }
 
-        let meta = match download::probe(url).await {
-            Ok(meta) => meta,
-            Err(err) => return EnqueueOutcome::Rejected(format!("probe failed: {err}")),
-        };
+        let track = if direct {
+            // No probe — we don't know the duration up front. Symphonia will
+            // figure out the codec from the file extension we keep on disk.
+            Track {
+                url: url.to_string(),
+                title: download::direct_audio_title(url),
+                duration_secs: 0,
+                requested_by: requested_by.to_string(),
+                is_direct: true,
+            }
+        } else {
+            let meta = match download::probe(url).await {
+                Ok(meta) => meta,
+                Err(err) => {
+                    // Keep yt-dlp's noisy stack trace in the logs only;
+                    // chat gets a short, friendly message.
+                    tracing::warn!(error = %err, url = %url, "yt-dlp probe failed");
+                    return EnqueueOutcome::Rejected(
+                        "could not extract this URL (unsupported site or private video)"
+                            .to_string(),
+                    );
+                }
+            };
 
-        if meta.is_live {
-            return EnqueueOutcome::Rejected("live streams are not allowed".to_string());
-        }
+            if meta.is_live {
+                return EnqueueOutcome::Rejected("live streams are not allowed".to_string());
+            }
 
-        let track = Track {
-            url: url.to_string(),
-            title: meta.title,
-            duration_secs: meta.duration_secs,
-            requested_by: requested_by.to_string(),
+            Track {
+                url: url.to_string(),
+                title: meta.title,
+                duration_secs: meta.duration_secs,
+                requested_by: requested_by.to_string(),
+                is_direct: false,
+            }
         };
 
         // Snapshot what the worker will do next.
@@ -421,17 +449,27 @@ impl Worker {
             track.requested_by.replace(['/', '\\'], "_"),
             sanitize_id(&track.url)
         ));
-        let path = match download::download_audio(&track.url, &dir).await {
+        let path = match if track.is_direct {
+            download::download_direct(&track.url, &dir).await
+        } else {
+            download::download_audio(&track.url, &dir).await
+        } {
             Ok(p) => p,
             Err(err) => {
-                tracing::error!(error = %err, url = %track.url, "yt-dlp download failed, skipping");
+                tracing::error!(error = %err, url = %track.url, "audio download failed, skipping");
                 self.refresh_pending_state().await;
                 return;
             }
         };
 
         // Decode and queue. yt-dlp transcodes to mp3 (`-x --audio-format mp3`)
-        // so we always feed the symphonia mp3 decoder.
+        // so for those we always feed the symphonia mp3 decoder. Direct URLs
+        // keep their extension, which symphonia uses to pick the right codec.
+        let hint = path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("mp3")
+            .to_string();
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(err) => {
@@ -443,7 +481,7 @@ impl Worker {
         };
         let decoder = match rodio::decoder::DecoderBuilder::new()
             .with_data(std::io::BufReader::new(file))
-            .with_hint("mp3")
+            .with_hint(&hint)
             .build()
         {
             Ok(d) => d,

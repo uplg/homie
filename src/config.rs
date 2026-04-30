@@ -28,6 +28,42 @@ pub struct EnvConfig {
     /// a virtual device (`BlackHole`, Loopback) so OBS can capture it. If
     /// `None`, the system default output device is used.
     pub audio_device: Option<String>,
+    /// Optional URL the `!club` chat command echoes back. When `None`, the
+    /// command is disabled (no reply, not advertised in `!commands`).
+    pub club_url: Option<String>,
+    /// Optional OBS WebSocket configuration for the `!screen` command. When
+    /// `None`, `!screen` is disabled.
+    pub obs: Option<ObsConfig>,
+}
+
+/// OBS WebSocket connection details for the `!screen` capture-restart command.
+#[derive(Debug, Clone)]
+pub struct ObsConfig {
+    pub host: String,
+    pub port: u16,
+    pub password: Option<String>,
+    /// Names of OBS input sources (typically Display/Window/macOS Screen
+    /// Capture) the `!screen` command should restart. Restarted in the
+    /// listed order.
+    pub sources: Vec<String>,
+    /// When `Some`, the bot polls each configured source via OBS screenshot
+    /// API and force-restarts it when the screenshot stops changing. The
+    /// `!screen` command stays available as a manual override regardless.
+    pub monitor: Option<ObsMonitorConfig>,
+}
+
+/// Tunables for the automatic capture-freeze monitor.
+#[derive(Debug, Clone, Copy)]
+pub struct ObsMonitorConfig {
+    /// Delay between two consecutive checks of a single source.
+    pub interval: std::time::Duration,
+    /// Number of consecutive identical screenshots required before declaring
+    /// the source frozen and triggering a restart. The Python reference uses
+    /// 2 (i.e. one interval = a clear stall, two = restart).
+    pub freeze_threshold: u32,
+    /// Quiet period after a successful restart to let OBS reinitialise the
+    /// source before resuming the comparisons. Avoids restart loops.
+    pub cooldown: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -123,6 +159,13 @@ impl EnvConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let club_url = env::var("TWITCHY_CLUB_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let obs = ObsConfig::from_env()?;
+
         Ok(Self {
             twitch_client_id,
             twitch_broadcaster_login,
@@ -132,7 +175,114 @@ impl EnvConfig {
             state_dir,
             rewards_file,
             audio_device,
+            club_url,
+            obs,
         })
+    }
+}
+
+impl ObsConfig {
+    /// Parse OBS settings from `OBS_WS_HOST`/`OBS_WS_PORT`/`OBS_WS_PASSWORD`/
+    /// `OBS_SOURCES`. Returns `None` when neither host nor sources are set,
+    /// so users who don't run OBS can simply omit the variables.
+    fn from_env() -> Result<Option<Self>> {
+        let host = env::var("OBS_WS_HOST")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let sources_raw = env::var("OBS_SOURCES")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if host.is_none() && sources_raw.is_none() {
+            return Ok(None);
+        }
+
+        let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = match env::var("OBS_WS_PORT") {
+            Ok(raw) => raw.trim().parse::<u16>().map_err(|err| {
+                Error::config(format!("OBS_WS_PORT must be a 0-65535 integer: {err}"))
+            })?,
+            Err(_) => 4455,
+        };
+        let password = env::var("OBS_WS_PASSWORD")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let sources: Vec<String> = sources_raw
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if sources.is_empty() {
+            return Err(Error::config(
+                "OBS_SOURCES must list at least one capture source name (comma-separated)",
+            ));
+        }
+
+        let monitor = ObsMonitorConfig::from_env()?;
+
+        Ok(Some(Self {
+            host,
+            port,
+            password,
+            sources,
+            monitor,
+        }))
+    }
+}
+
+impl ObsMonitorConfig {
+    /// Parse the auto-monitor settings. Disabled by default; set
+    /// `OBS_MONITOR_ENABLED=true` (or `1`) to opt in.
+    fn from_env() -> Result<Option<Self>> {
+        let enabled = env::var("OBS_MONITOR_ENABLED")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+        if !enabled {
+            return Ok(None);
+        }
+
+        let interval_secs = parse_positive_u64_env("OBS_MONITOR_INTERVAL_SECS", 60)?;
+        let freeze_threshold =
+            u32::try_from(parse_positive_u64_env("OBS_MONITOR_FREEZE_THRESHOLD", 2)?)
+                .map_err(|_| Error::config("OBS_MONITOR_FREEZE_THRESHOLD must fit in a u32"))?;
+        if freeze_threshold == 0 {
+            return Err(Error::config(
+                "OBS_MONITOR_FREEZE_THRESHOLD must be at least 1",
+            ));
+        }
+        let cooldown_secs = parse_positive_u64_env("OBS_MONITOR_COOLDOWN_SECS", 30)?;
+
+        Ok(Some(Self {
+            interval: std::time::Duration::from_secs(interval_secs),
+            freeze_threshold,
+            cooldown: std::time::Duration::from_secs(cooldown_secs),
+        }))
+    }
+}
+
+fn parse_positive_u64_env(name: &str, default: u64) -> Result<u64> {
+    match env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(default);
+            }
+            let value = trimmed.parse::<u64>().map_err(|err| {
+                Error::config(format!("{name} must be a positive integer: {err}"))
+            })?;
+            if value == 0 {
+                return Err(Error::config(format!("{name} must be greater than zero")));
+            }
+            Ok(value)
+        }
+        Err(_) => Ok(default),
     }
 }
 
