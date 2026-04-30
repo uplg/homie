@@ -21,7 +21,7 @@ async fn main() -> ExitCode {
     dotenvy::dotenv().ok();
     install_rustls_provider();
 
-    match run().await {
+    match Box::pin(run()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %err, "twitchy stopped on error");
@@ -81,6 +81,11 @@ async fn run() -> Result<()> {
             ))
         })?;
 
+    // Wipe any orphan EventSub subscriptions left by previous runs of this
+    // client_id. Done before opening the WebSocket so the bot only sees
+    // events from the subscriptions it creates this run.
+    eventsub::cleanup_existing_subscriptions(&helix, token.as_ref()).await?;
+
     let yt_cache = cfg.env.state_dir.join("yt-cache");
     let yt_cfg = yt_queue::Config {
         audio_device: cfg.env.audio_device.clone(),
@@ -95,6 +100,7 @@ async fn run() -> Result<()> {
         rewards: Arc::new(cfg.rewards.clone()),
         maison: maison.clone(),
         yt: yt.clone(),
+        state: Arc::new(tokio::sync::Mutex::new(eventsub::EventSubState::default())),
     };
 
     // 4) Run EventSub loop with bounded reconnect backoff, alongside Ctrl+C ----------

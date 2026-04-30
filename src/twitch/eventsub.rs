@@ -4,9 +4,11 @@
 //! frame to learn the `session_id`, then creates the subscriptions we need
 //! via Helix and dispatches notifications to the rest of the bot.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use twitch_api::{
     HelixClient,
@@ -14,7 +16,10 @@ use twitch_api::{
         Event, EventsubWebsocketData, Message as EventMessage, Transport,
         channel::{ChannelChatMessageV1, ChannelPointsCustomRewardRedemptionAddV1},
     },
-    helix::eventsub::CreateEventSubSubscriptionRequest,
+    helix::eventsub::{
+        CreateEventSubSubscriptionRequest, DeleteEventSubSubscriptionRequest,
+        GetEventSubSubscriptionsRequest,
+    },
     types::UserId,
 };
 use twitch_oauth2::UserToken;
@@ -30,6 +35,43 @@ use crate::{
 };
 
 const DEFAULT_WS_URL: &str = "wss://eventsub.wss.twitch.tv/ws";
+/// How many recent `EventSub` `message_id`s we remember to drop duplicates.
+/// Twitch's at-least-once delivery occasionally redelivers, and reconnect
+/// flows can carry over notifications across sockets. 256 covers any
+/// realistic backlog window.
+const SEEN_MESSAGE_CAPACITY: usize = 256;
+
+/// Mutable state that has to survive across consecutive `run_session`
+/// invocations: which session we already subscribed against (so we don't
+/// re-subscribe on a Twitch-driven reconnect — the carryover session
+/// keeps existing subscriptions live), and a small ring of seen
+/// `message_ids` for dedupe.
+#[derive(Default)]
+pub struct EventSubState {
+    subscribed_session_id: Option<String>,
+    seen_message_ids: VecDeque<String>,
+}
+
+impl EventSubState {
+    fn already_subscribed(&self, session_id: &str) -> bool {
+        self.subscribed_session_id.as_deref() == Some(session_id)
+    }
+
+    fn mark_subscribed(&mut self, session_id: &str) {
+        self.subscribed_session_id = Some(session_id.to_string());
+    }
+
+    fn note_message(&mut self, message_id: &str) -> bool {
+        if self.seen_message_ids.iter().any(|id| id == message_id) {
+            return false;
+        }
+        if self.seen_message_ids.len() >= SEEN_MESSAGE_CAPACITY {
+            self.seen_message_ids.pop_front();
+        }
+        self.seen_message_ids.push_back(message_id.to_string());
+        true
+    }
+}
 
 /// Shared dependencies the WS loop needs at runtime.
 #[derive(Clone)]
@@ -40,6 +82,7 @@ pub struct EventSubContext {
     pub rewards: Arc<RewardsConfig>,
     pub maison: Arc<MaisonClient>,
     pub yt: Arc<YtQueue>,
+    pub state: Arc<Mutex<EventSubState>>,
 }
 
 /// Run a single WebSocket session against `url` until the server closes
@@ -87,8 +130,22 @@ async fn handle_text_frame(ctx: &EventSubContext, text: &str) -> Result<Option<S
     match parsed {
         EventsubWebsocketData::Welcome { payload, .. } => {
             let session_id = payload.session.id.to_string();
-            tracing::info!(session_id = %session_id, "EventSub session welcomed");
-            create_subscriptions(ctx, &session_id).await?;
+            // Twitch's reconnect flow hands us a new URL but the session_id
+            // carries over and the existing subscriptions stay live. The doc is
+            // explicit: "Do not recreate your subscriptions". We track the last
+            // session_id we subscribed against and skip if it's the same.
+            let state = ctx.state.lock().await;
+            if state.already_subscribed(&session_id) {
+                tracing::info!(
+                    session_id = %session_id,
+                    "EventSub session welcomed (reconnect carryover, subscriptions reused)"
+                );
+            } else {
+                tracing::info!(session_id = %session_id, "EventSub session welcomed");
+                drop(state);
+                create_subscriptions(ctx, &session_id).await?;
+                ctx.state.lock().await.mark_subscribed(&session_id);
+            }
             Ok(None)
         }
         EventsubWebsocketData::Keepalive { .. } => {
@@ -122,6 +179,44 @@ async fn handle_text_frame(ctx: &EventSubContext, text: &str) -> Result<Option<S
         // Forward-compat: skip any future variant.
         _ => Ok(None),
     }
+}
+
+/// Delete every existing `EventSub` subscription this `client_id` owns on
+/// Twitch's backend. Run once at startup before the WS loop. Without this,
+/// orphan subscriptions left over from previous bot runs (crashes, kill -9,
+/// hot reloads) keep delivering the same chat messages alongside the new
+/// session's subs and you see every reply two-, three- or N-fold in chat.
+pub async fn cleanup_existing_subscriptions(
+    helix: &HelixClient<'static, reqwest::Client>,
+    token: &UserToken,
+) -> Result<()> {
+    let req = GetEventSubSubscriptionsRequest::default();
+    let response = helix
+        .req_get(req, token)
+        .await
+        .map_err(|err| Error::twitch(format!("list eventsub subscriptions: {err}")))?;
+
+    let subs = response.data.subscriptions;
+    if subs.is_empty() {
+        tracing::info!("no existing EventSub subscriptions to clean up");
+        return Ok(());
+    }
+
+    tracing::info!(
+        count = subs.len(),
+        "deleting existing EventSub subscriptions"
+    );
+    for sub in subs {
+        let id = sub.id.clone();
+        match helix
+            .req_delete(DeleteEventSubSubscriptionRequest::id(&id), token)
+            .await
+        {
+            Ok(_) => tracing::debug!(id = %id, "deleted EventSub subscription"),
+            Err(err) => tracing::warn!(id = %id, error = %err, "could not delete subscription"),
+        }
+    }
+    Ok(())
 }
 
 async fn create_subscriptions(ctx: &EventSubContext, session_id: &str) -> Result<()> {
@@ -166,11 +261,25 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
     match event {
         Event::ChannelPointsCustomRewardRedemptionAddV1(payload) => {
             if let EventMessage::Notification(redemption) = payload.message {
+                // Dedup by the redemption's stable id. Multiple subscriptions
+                // delivering the same redemption — orphans, reconnect replays
+                // — share the same payload id even though their EventSub
+                // envelopes differ.
+                let key = format!("redemption:{}", redemption.id);
+                if !ctx.state.lock().await.note_message(&key) {
+                    tracing::debug!(key, "duplicate redemption, skipping");
+                    return Ok(());
+                }
                 return handle_redemption(ctx, &redemption).await;
             }
         }
         Event::ChannelChatMessageV1(payload) => {
             if let EventMessage::Notification(message) = payload.message {
+                let key = format!("chat:{}", message.message_id);
+                if !ctx.state.lock().await.note_message(&key) {
+                    tracing::debug!(key, "duplicate chat message, skipping");
+                    return Ok(());
+                }
                 return chat::dispatch(
                     &message,
                     &ctx.rewards,
