@@ -28,6 +28,8 @@ pub struct EnvConfig {
     /// a virtual device (`BlackHole`, Loopback) so OBS can capture it. If
     /// `None`, the system default output device is used.
     pub audio_device: Option<String>,
+    /// Initial volume (0–100) the music queue starts at. Defaults to 80.
+    pub initial_volume_percent: u8,
     /// Optional URL the `!club` chat command echoes back. When `None`, the
     /// command is disabled (no reply, not advertised in `!commands`).
     pub club_url: Option<String>,
@@ -159,6 +161,28 @@ impl EnvConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let initial_volume_percent = match env::var("TWITCHY_INITIAL_VOLUME") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    80
+                } else {
+                    let parsed = trimmed.parse::<u8>().map_err(|err| {
+                        Error::config(format!(
+                            "TWITCHY_INITIAL_VOLUME must be an integer 0-100: {err}"
+                        ))
+                    })?;
+                    if parsed > 100 {
+                        return Err(Error::config(
+                            "TWITCHY_INITIAL_VOLUME must be between 0 and 100",
+                        ));
+                    }
+                    parsed
+                }
+            }
+            Err(_) => 80,
+        };
+
         let club_url = env::var("TWITCHY_CLUB_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -175,6 +199,7 @@ impl EnvConfig {
             state_dir,
             rewards_file,
             audio_device,
+            initial_volume_percent,
             club_url,
             obs,
         })

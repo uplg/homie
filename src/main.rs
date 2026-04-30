@@ -90,6 +90,7 @@ async fn run() -> Result<()> {
     let yt_cache = cfg.env.state_dir.join("yt-cache");
     let yt_cfg = yt_queue::Config {
         audio_device: cfg.env.audio_device.clone(),
+        initial_volume_percent: cfg.env.initial_volume_percent,
         ..Default::default()
     };
     let yt = Arc::new(YtQueue::start(yt_cache, yt_cfg).await);
