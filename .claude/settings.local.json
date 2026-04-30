@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s 'https://crates.io/api/v1/crates/twitch_api')",
+      "Bash(python3 -c 'import json,sys;d=json.load\\(sys.stdin\\);c=d[\"crate\"];print\\(\"max_stable:\",c.get\\(\"max_stable_version\"\\)\\);print\\(\"max:\",c.get\\(\"max_version\"\\)\\);print\\(\"newest:\",c.get\\(\"newest_version\"\\)\\);print\\(\"recent versions:\"\\);[print\\(\" -\",v[\"num\"],v.get\\(\"created_at\"\\)\\) for v in d[\"versions\"][:10]]')",
+      "Bash(python3 -c 'import json,sys;d=json.load\\(sys.stdin\\);v=d[\"versions\"][0];print\\(\"version:\",v[\"num\"]\\);print\\(\"rust_version:\",v.get\\(\"rust_version\"\\)\\);print\\(\"edition:\",v.get\\(\"edition\"\\)\\);print\\(\"features:\"\\);[print\\(\" -\",k,\":\",vv\\) for k,vv in \\(v.get\\(\"features\"\\) or {}\\).items\\(\\)]')",
+      "Bash(curl -s 'https://crates.io/api/v1/crates/twitch_oauth2')",
+      "Bash(python3 -c 'import json,sys;d=json.load\\(sys.stdin\\);print\\(\"max:\",d[\"crate\"].get\\(\"max_stable_version\"\\)\\)')",
+      "Bash(curl -s https://crates.io/api/v1/crates/__TRACKED_VAR__)"
+    ]
+  }
+}

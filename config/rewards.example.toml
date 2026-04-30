@@ -1,0 +1,50 @@
+# Mapping: Twitch reward title / chat command -> Maison API action.
+# Copy this file to `config/rewards.toml` and adapt the IDs to your setup.
+#
+# `match` is exclusive:
+#   - `chat_command = "!word"`          -> matches a chat message starting with !word.
+#   - `reward = "<exact title>"`        -> matches a channel-points redemption (Affiliate/Partner only).
+#
+# `admin_only = true` (default false) restricts a chat command to broadcaster/moderator badges.
+# `reply` is the chat confirmation message; if omitted, the Maison response message is echoed.
+#
+# The bot ships with a built-in `!commands` that lists every chat_command rule defined here
+# (split between public and admin-only). You don't need to declare it.
+
+# --- Zigbee lamp ---
+[[rules]]
+match = { chat_command = "!lamp_on" }
+action = { kind = "lamp_power", lamp_id = "001788010904ff17", enabled = true }
+reply = "Lamp -> ON"
+
+[[rules]]
+match = { chat_command = "!lamp_off" }
+action = { kind = "lamp_power", lamp_id = "001788010904ff17", enabled = false }
+reply = "Lamp -> OFF"
+
+[[rules]]
+match = { chat_command = "!lamp_dim" }
+action = { kind = "lamp_brightness", lamp_id = "001788010904ff17", brightness = 80 }
+
+[[rules]]
+match = { chat_command = "!lamp_red" }
+action = { kind = "lamp_color", lamp_id = "001788010904ff17", x = 0.7006, y = 0.2993 }
+
+# --- Tuya feeder ---
+[[rules]]
+match = { chat_command = "!feed_apollo" }
+action = { kind = "feeder_feed", device_id = "bf123abc456def", portion = 1 }
+reply = "Apollo is being fed!"
+
+# --- Mitsubishi AC (admin only) ---
+[[rules]]
+match = { chat_command = "!ac_on" }
+admin_only = true
+action = { kind = "ac_mitsubishi", host = "192.168.1.42", command = "power_on_cool_22", model = "msz" }
+reply = "AC -> ON 22°C"
+
+[[rules]]
+match = { chat_command = "!ac_off" }
+admin_only = true
+action = { kind = "ac_mitsubishi", host = "192.168.1.42", command = "power_off", model = "msz" }
+reply = "AC -> OFF"

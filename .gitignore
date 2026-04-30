@@ -1,0 +1,5 @@
+/target
+.env
+.twitchy/
+*.log
+config/rewards.toml
