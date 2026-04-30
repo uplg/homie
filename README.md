@@ -11,6 +11,9 @@ Twitch bot that bridges **channel-point redemptions** and **chat commands** to a
 - Rust toolchain (1.95+ for edition 2024). `rustup default stable` is enough on a recent install.
 - A Maison instance reachable from where the bot runs (default port `:3033`), with valid `users.json` credentials.
 - A Twitch account that owns the channel you want to drive (the broadcaster account).
+- For the music queue (`!yt`): `yt-dlp` and `ffmpeg` on the PATH. On macOS: `brew install yt-dlp ffmpeg`. The bot runs without them but `!yt` will reject submissions with a friendly error.
+- For the auto pause/resume of your music when a viewer track starts: `nowplaying-cli` on the PATH (`brew install nowplaying-cli`). Without it the bot still plays viewer tracks but won't pause anything. The bot logs a warning at startup if missing.
+- For OBS to capture the bot's audio: a virtual audio device (e.g. [BlackHole](https://github.com/ExistentialAudio/BlackHole) — `brew install blackhole-2ch`). Combine it with your usual output via *Audio MIDI Setup → New Multi-Output Device* if you also want to hear the music. Then set `TWITCHY_AUDIO_DEVICE=BlackHole` in `.env` and add a *macOS Audio Capture* / *Audio Output Capture* source in OBS pointing at BlackHole.
 
 ## Configuration walkthrough
 
@@ -92,7 +95,21 @@ This file maps Twitch rewards / chat commands to Maison actions. Each entry has:
 - `reply` (optional): chat message sent on success. Omit it to echo the Maison response instead. Set it to `""` to suppress the reply entirely.
 - `admin_only` (optional, defaults to `false`): when `true`, ignore the command unless the sender has the broadcaster or moderator badge.
 
-The bot ships with a built-in `!commands` chat command that lists every `chat_command` rule defined in `rewards.toml` (split between public and admin-only). It always works and is appended to the listing automatically — you don't need to declare it.
+### Built-in chat commands
+
+These work without any entry in `rewards.toml`:
+
+| Command            | Who           | What it does                                                                                                |
+|--------------------|---------------|-------------------------------------------------------------------------------------------------------------|
+| `!commands`        | anyone        | Lists every available command (built-ins + user rules), split between public and admin-only.                |
+| `!yt <URL>`        | anyone        | Adds a track to the music queue. Rejects live streams and tracks longer than 10 minutes.                    |
+| `!queue`           | anyone        | Shows what's playing and the next 5 tracks in the queue.                                                    |
+| `!volume <0-100>`  | broadcaster/mod | Sets playback volume. Without an argument, replies with the current volume.                                |
+| `!skip`            | broadcaster/mod | Skips the current track and starts the next one.                                                           |
+
+When the first viewer track of a session starts, the bot calls `nowplaying-cli togglePlayPause`. That CLI talks to Apple's private `MediaRemote.framework` and operates on whichever app currently owns Now Playing — Apple Music, Spotify, a YouTube tab in any browser, Tidal, Apple Podcasts, anything. The bot then waits ~350 ms so the system audio buffer drains, then plays its own track. When the queue empties, it calls `togglePlayPause` again to resume the user's audio.
+
+> Pure AppleScript media keys (`tell application "System Events" to key code 100`) **do not** trigger Now Playing on modern macOS — they send F8 as a regular keystroke. `nowplaying-cli` is the only reliable shell-level path to Now Playing, hence the prerequisite.
 
 #### Action kinds
 

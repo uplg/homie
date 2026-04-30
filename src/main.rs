@@ -12,12 +12,14 @@ use twitchy::{
         auth::{self, DevicePrompt},
         eventsub::{self, EventSubContext},
     },
+    yt_queue::{self, YtQueue},
 };
 
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
     dotenvy::dotenv().ok();
+    install_rustls_provider();
 
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
@@ -25,6 +27,19 @@ async fn main() -> ExitCode {
             tracing::error!(error = %err, "twitchy stopped on error");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Several of our deps pull `rustls 0.23` transitively (`reqwest`, `tokio-tungstenite`,
+/// `twitch_api`). With multiple `rustls-tls` features active, rustls cannot auto-pick
+/// a `CryptoProvider` and panics on first TLS handshake. We install one explicitly
+/// before any networking happens.
+fn install_rustls_provider() {
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // Another part of the process beat us to it; that's fine.
     }
 }
 
@@ -66,12 +81,20 @@ async fn run() -> Result<()> {
             ))
         })?;
 
+    let yt_cache = cfg.env.state_dir.join("yt-cache");
+    let yt_cfg = yt_queue::Config {
+        audio_device: cfg.env.audio_device.clone(),
+        ..Default::default()
+    };
+    let yt = Arc::new(YtQueue::start(yt_cache, yt_cfg).await);
+
     let ctx = EventSubContext {
         helix,
         token: token.clone(),
         broadcaster_user_id: broadcaster.id,
         rewards: Arc::new(cfg.rewards.clone()),
         maison: maison.clone(),
+        yt: yt.clone(),
     };
 
     // 4) Run EventSub loop with bounded reconnect backoff, alongside Ctrl+C ----------
@@ -85,6 +108,7 @@ async fn run() -> Result<()> {
             biased;
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal received, exiting");
+                yt.shutdown();
                 return Ok(());
             }
             res = eventsub::run_session(&ctx, &url) => {

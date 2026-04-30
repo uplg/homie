@@ -64,6 +64,14 @@ A phase is only complete when all three commands pass clean. Fix clippy warnings
 - OAuth: **Device Code Flow only** (the bot runs with no HTTP server).
 - EventSub subscriptions: `channel.channel_points_custom_reward_redemption.add`, `channel.chat.message`.
 
+## Music queue (`yt_queue` module)
+
+- Audio playback uses `rodio 0.22` (which itself wraps cpal + symphonia). One worker tokio task owns the rodio `Player`; chat handlers send commands via mpsc.
+- Track downloads use the `yt-dlp` crate from the `Guilherme-j10/yt-dlp` fork (`develop` branch). Upstream `yt-dlp 2.7.x` on crates.io is broken: it transitively pins `lofty 0.23.x` which is fully yanked. Drop the git override the day a fixed crate version lands.
+- The system-installed `yt-dlp` and `ffmpeg` binaries (e.g. via `brew install`) are required at runtime; the crate calls them as subprocesses.
+- macOS coordination: pause/resume goes through `nowplaying-cli togglePlayPause` (`brew install nowplaying-cli`). That CLI calls Apple's private `MediaRemote.framework`, which is the only reliable way to operate on Now Playing from a shell. AppleScript synthetic key codes (`tell application "System Events" to key code 100`) look right but only send F8 as a regular keystroke — they never trigger media-routing. Hence the soft dep.
+- Audio output: `cpal::Device` selection by substring match against `TWITCHY_AUDIO_DEVICE` (case-insensitive). Without the env var we open the system default. Useful to route the bot through `BlackHole` so OBS can capture viewer-queue audio independently of the system mix. The bot logs available output devices at startup so the operator knows what to set.
+
 ## Out of scope (explicit non-goals)
 
 - No HTTP webhook EventSub transport — WebSocket only.
@@ -71,3 +79,4 @@ A phase is only complete when all three commands pass clean. Fix clippy warnings
 - No `MaisonApi` trait abstraction while there is a single implementation.
 - The Maison password is read from `.env` once at startup; it is never stored elsewhere.
 - No web UI — configuration is exclusively `config/rewards.toml`.
+- The music queue is macOS-only (the pause/resume logic uses `osascript`). Linux/Windows would need a separate backend.

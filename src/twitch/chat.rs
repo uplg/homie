@@ -19,10 +19,16 @@ use crate::{
     config::{Matcher, RewardsConfig, Rule},
     error::{Error, Result},
     maison::MaisonClient,
+    yt_queue::{EnqueueOutcome, YtQueue},
 };
 
-/// Built-in command name listing every available chat command.
+/// Built-in commands. `!commands` lists every available command, `!yt` and
+/// `!queue` are public, the rest is admin-only.
 pub const COMMANDS_BUILTIN: &str = "!commands";
+pub const YT_BUILTIN: &str = "!yt";
+pub const QUEUE_BUILTIN: &str = "!queue";
+pub const VOLUME_BUILTIN: &str = "!volume";
+pub const SKIP_BUILTIN: &str = "!skip";
 
 /// Extract a `!command` from the start of a chat line.
 ///
@@ -31,6 +37,15 @@ pub const COMMANDS_BUILTIN: &str = "!commands";
 /// has no leading `!`, or only contains a lone `!`.
 #[must_use]
 pub fn parse_command(text: &str) -> Option<&str> {
+    parse_command_with_args(text).map(|(cmd, _)| cmd)
+}
+
+/// Like [`parse_command`] but also returns the trimmed remainder of the line.
+///
+/// `parse_command_with_args("!yt https://...")` returns `Some(("!yt", "https://..."))`.
+/// The remainder may be empty.
+#[must_use]
+pub fn parse_command_with_args(text: &str) -> Option<(&str, &str)> {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('!') {
         return None;
@@ -39,7 +54,8 @@ pub fn parse_command(text: &str) -> Option<&str> {
     if token.len() < 2 {
         return None;
     }
-    Some(token)
+    let rest = trimmed[token.len()..].trim();
+    Some((token, rest))
 }
 
 /// True if the badge list contains a broadcaster or moderator badge.
@@ -50,21 +66,27 @@ pub fn is_admin(badges: &[Badge]) -> bool {
         .any(|badge| badge.set_id.as_str() == "broadcaster" || badge.set_id.as_str() == "moderator")
 }
 
+/// Built-ins that are always available, in display order.
+const PUBLIC_BUILTINS: &[&str] = &[COMMANDS_BUILTIN, YT_BUILTIN, QUEUE_BUILTIN];
+const ADMIN_BUILTINS: &[&str] = &[VOLUME_BUILTIN, SKIP_BUILTIN];
+
+fn is_builtin(command: &str) -> bool {
+    PUBLIC_BUILTINS.contains(&command) || ADMIN_BUILTINS.contains(&command)
+}
+
 /// Build the reply for the built-in `!commands` listing.
 ///
-/// Pulls every `chat_command` rule from `rewards`, splits between public
-/// and admin-only, and prepends `!commands` itself so the built-in
-/// appears in its own listing. The user can also define a `!commands`
-/// rule of their own; the built-in takes precedence and the user rule
-/// is shown but not duplicated.
+/// Lists every built-in plus every user-defined `chat_command` rule from
+/// `rewards`, split between public and admin-only. User rules whose name
+/// collides with a built-in are dropped (built-ins always win).
 #[must_use]
 pub fn format_commands_list(rewards: &RewardsConfig) -> String {
-    let mut public: Vec<&str> = vec![COMMANDS_BUILTIN];
-    let mut admin: Vec<&str> = Vec::new();
+    let mut public: Vec<&str> = PUBLIC_BUILTINS.to_vec();
+    let mut admin: Vec<&str> = ADMIN_BUILTINS.to_vec();
 
     for rule in &rewards.rules {
         if let Matcher::ChatCommand { chat_command } = &rule.matcher {
-            if chat_command == COMMANDS_BUILTIN {
+            if is_builtin(chat_command) {
                 continue;
             }
             if rule.admin_only {
@@ -90,16 +112,15 @@ pub async fn dispatch(
     maison: &Arc<MaisonClient>,
     helix: &HelixClient<'static, reqwest::Client>,
     token: &UserToken,
+    yt: &Arc<YtQueue>,
 ) -> Result<()> {
-    let Some(command) = parse_command(&payload.message.text) else {
+    let Some((command, args)) = parse_command_with_args(&payload.message.text) else {
         return Ok(());
     };
 
-    // Built-in: list every configured chat command.
-    if command == COMMANDS_BUILTIN {
-        let listing = format_commands_list(rewards);
-        send_message(helix, token, &payload.broadcaster_user_id, &listing).await?;
-        return Ok(());
+    // Built-ins are intercepted before the user-rule lookup so they always work.
+    if is_builtin(command) {
+        return handle_builtin(command, args, payload, rewards, helix, token, yt).await;
     }
 
     let Some(rule) = actions::rule_for_chat_command(rewards, command) else {
@@ -145,6 +166,149 @@ fn effective_reply<'a>(rule: &'a Rule, fallback: &'a str) -> Option<&'a str> {
         Some(_) => None, // explicit empty string disables reply
         None => Some(fallback),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_builtin(
+    command: &str,
+    args: &str,
+    payload: &ChannelChatMessageV1Payload,
+    rewards: &RewardsConfig,
+    helix: &HelixClient<'static, reqwest::Client>,
+    token: &UserToken,
+    yt: &Arc<YtQueue>,
+) -> Result<()> {
+    match command {
+        COMMANDS_BUILTIN => {
+            let listing = format_commands_list(rewards);
+            send_message(helix, token, &payload.broadcaster_user_id, &listing).await
+        }
+        YT_BUILTIN => handle_yt(args, payload, helix, token, yt).await,
+        QUEUE_BUILTIN => handle_queue(payload, helix, token, yt).await,
+        VOLUME_BUILTIN => {
+            if !is_admin(&payload.badges) {
+                return Ok(());
+            }
+            handle_volume(args, payload, helix, token, yt).await
+        }
+        SKIP_BUILTIN => {
+            if !is_admin(&payload.badges) {
+                return Ok(());
+            }
+            yt.skip();
+            send_message(
+                helix,
+                token,
+                &payload.broadcaster_user_id,
+                "Skipping current track",
+            )
+            .await
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn handle_yt(
+    args: &str,
+    payload: &ChannelChatMessageV1Payload,
+    helix: &HelixClient<'static, reqwest::Client>,
+    token: &UserToken,
+    yt: &Arc<YtQueue>,
+) -> Result<()> {
+    let url = args.split_whitespace().next().unwrap_or("");
+    if url.is_empty() {
+        return send_message(
+            helix,
+            token,
+            &payload.broadcaster_user_id,
+            "Usage: !yt <YouTube URL>",
+        )
+        .await;
+    }
+    let outcome = yt.enqueue(url, payload.chatter_user_login.as_str()).await;
+    let reply = match outcome {
+        EnqueueOutcome::StartingNow { title } => format!("Now playing: {title}"),
+        EnqueueOutcome::Queued { title, position } => {
+            format!("Queued at #{position}: {title}")
+        }
+        EnqueueOutcome::Rejected(reason) => format!("⚠ {reason}"),
+    };
+    send_message(helix, token, &payload.broadcaster_user_id, &reply).await
+}
+
+async fn handle_queue(
+    payload: &ChannelChatMessageV1Payload,
+    helix: &HelixClient<'static, reqwest::Client>,
+    token: &UserToken,
+    yt: &Arc<YtQueue>,
+) -> Result<()> {
+    let state = yt.snapshot().await;
+    let mut parts = Vec::new();
+    if let Some(current) = state.current.as_ref() {
+        parts.push(format!("Now: {} ({})", current.title, current.requested_by));
+    }
+    if !state.pending.is_empty() {
+        let queued: Vec<String> = state
+            .pending
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(i, t)| format!("#{} {} ({})", i + 1, t.title, t.requested_by))
+            .collect();
+        let suffix = if state.pending.len() > 5 {
+            format!(" + {} more", state.pending.len() - 5)
+        } else {
+            String::new()
+        };
+        parts.push(format!("Up next: {}{suffix}", queued.join(" | ")));
+    }
+    let reply = if parts.is_empty() {
+        "Queue is empty".to_string()
+    } else {
+        parts.join(" || ")
+    };
+    send_message(helix, token, &payload.broadcaster_user_id, &reply).await
+}
+
+async fn handle_volume(
+    args: &str,
+    payload: &ChannelChatMessageV1Payload,
+    helix: &HelixClient<'static, reqwest::Client>,
+    token: &UserToken,
+    yt: &Arc<YtQueue>,
+) -> Result<()> {
+    let arg = args.split_whitespace().next().unwrap_or("");
+    if arg.is_empty() {
+        let current = yt.snapshot().await.volume_percent;
+        return send_message(
+            helix,
+            token,
+            &payload.broadcaster_user_id,
+            &format!("Volume: {current}% (use `!volume <0-100>` to change)"),
+        )
+        .await;
+    }
+    let parsed: std::result::Result<u8, _> = arg.parse();
+    let percent = match parsed {
+        Ok(value) if value <= 100 => value,
+        _ => {
+            return send_message(
+                helix,
+                token,
+                &payload.broadcaster_user_id,
+                "Usage: !volume <0-100>",
+            )
+            .await;
+        }
+    };
+    let applied = yt.set_volume(percent);
+    send_message(
+        helix,
+        token,
+        &payload.broadcaster_user_id,
+        &format!("Volume set to {applied}%"),
+    )
+    .await
 }
 
 async fn send_message(
@@ -194,10 +358,12 @@ mod tests {
         assert_eq!(parse_command("!Foo"), Some("!Foo"));
     }
 
+    const BUILTINS_ONLY: &str = "Commands: !commands, !yt, !queue | Admin only: !volume, !skip";
+
     #[test]
-    fn format_commands_list_empty_config_only_builtin() {
+    fn format_commands_list_empty_config_only_builtins() {
         let cfg = RewardsConfig::parse("").unwrap();
-        assert_eq!(format_commands_list(&cfg), "Commands: !commands");
+        assert_eq!(format_commands_list(&cfg), BUILTINS_ONLY);
     }
 
     #[test]
@@ -228,7 +394,8 @@ mod tests {
         let listing = format_commands_list(&cfg);
         assert_eq!(
             listing,
-            "Commands: !commands, !lamp_on, !feed_apollo | Admin only: !ac_on, !ac_off"
+            "Commands: !commands, !yt, !queue, !lamp_on, !feed_apollo \
+             | Admin only: !volume, !skip, !ac_on, !ac_off"
         );
     }
 
@@ -247,21 +414,44 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(format_commands_list(&cfg), "Commands: !commands, !lamp_on");
+        assert_eq!(
+            format_commands_list(&cfg),
+            "Commands: !commands, !yt, !queue, !lamp_on | Admin only: !volume, !skip"
+        );
     }
 
     #[test]
-    fn format_commands_list_dedupes_user_defined_commands_alias() {
-        // If the user redeclares !commands, the built-in still wins and we
-        // don't list it twice.
+    fn format_commands_list_dedupes_user_defined_builtin_alias() {
+        // If the user redeclares one of the built-ins, the built-in still
+        // wins and we don't list it twice.
         let cfg = RewardsConfig::parse(
             r#"
             [[rules]]
-            match = { chat_command = "!commands" }
+            match = { chat_command = "!yt" }
+            action = { kind = "lamp_power", lamp_id = "x", enabled = true }
+
+            [[rules]]
+            match = { chat_command = "!skip" }
+            admin_only = true
             action = { kind = "lamp_power", lamp_id = "x", enabled = true }
             "#,
         )
         .unwrap();
-        assert_eq!(format_commands_list(&cfg), "Commands: !commands");
+        assert_eq!(format_commands_list(&cfg), BUILTINS_ONLY);
+    }
+
+    #[test]
+    fn parse_command_with_args_splits_url() {
+        let (cmd, rest) =
+            parse_command_with_args("!yt https://www.youtube.com/watch?v=foo extra args").unwrap();
+        assert_eq!(cmd, "!yt");
+        assert_eq!(rest, "https://www.youtube.com/watch?v=foo extra args");
+    }
+
+    #[test]
+    fn parse_command_with_args_handles_no_args() {
+        let (cmd, rest) = parse_command_with_args("!queue").unwrap();
+        assert_eq!(cmd, "!queue");
+        assert_eq!(rest, "");
     }
 }

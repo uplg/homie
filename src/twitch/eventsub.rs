@@ -26,6 +26,7 @@ use crate::{
     error::{Error, Result},
     maison::MaisonClient,
     twitch::chat,
+    yt_queue::YtQueue,
 };
 
 const DEFAULT_WS_URL: &str = "wss://eventsub.wss.twitch.tv/ws";
@@ -38,6 +39,7 @@ pub struct EventSubContext {
     pub broadcaster_user_id: UserId,
     pub rewards: Arc<RewardsConfig>,
     pub maison: Arc<MaisonClient>,
+    pub yt: Arc<YtQueue>,
 }
 
 /// Run a single WebSocket session against `url` until the server closes
@@ -175,6 +177,7 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                     &ctx.maison,
                     &ctx.helix,
                     ctx.token.as_ref(),
+                    &ctx.yt,
                 )
                 .await;
             }

@@ -23,6 +23,11 @@ pub struct EnvConfig {
     pub maison_password: String,
     pub state_dir: PathBuf,
     pub rewards_file: PathBuf,
+    /// Optional substring matched against macOS output device names to pick
+    /// the audio output the bot writes to. Useful to route the bot through
+    /// a virtual device (`BlackHole`, Loopback) so OBS can capture it. If
+    /// `None`, the system default output device is used.
+    pub audio_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -113,6 +118,10 @@ impl EnvConfig {
         let rewards_file = env::var("REWARDS_FILE")
             .unwrap_or_else(|_| DEFAULT_REWARDS_FILE.to_string())
             .into();
+        let audio_device = env::var("TWITCHY_AUDIO_DEVICE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
 
         Ok(Self {
             twitch_client_id,
@@ -122,6 +131,7 @@ impl EnvConfig {
             maison_password,
             state_dir,
             rewards_file,
+            audio_device,
         })
     }
 }
