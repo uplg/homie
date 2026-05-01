@@ -101,7 +101,7 @@ async fn probe_downloader() -> Result<Arc<Downloader>> {
     let yt = which("yt-dlp").await?;
     let ff = which("ffmpeg").await?;
     let libs = Libraries::new(yt, ff);
-    let scratch = std::env::temp_dir().join("twitchy-yt-probe");
+    let scratch = std::env::temp_dir().join("homie-yt-probe");
     let dl = Downloader::builder(libs, scratch)
         .build()
         .await

@@ -323,7 +323,7 @@ fn list_output_devices() -> Vec<(String, cpal::Device)> {
 }
 
 /// Log the available macOS output devices at INFO once on startup so the
-/// user knows exactly what string to put in `TWITCHY_AUDIO_DEVICE`.
+/// user knows exactly what string to put in `HOMIE_AUDIO_DEVICE`.
 fn log_available_output_devices() {
     let names: Vec<String> = list_output_devices().into_iter().map(|(n, _)| n).collect();
     if names.is_empty() {
@@ -331,7 +331,7 @@ fn log_available_output_devices() {
     } else {
         tracing::info!(
             devices = ?names,
-            "available output audio devices (set TWITCHY_AUDIO_DEVICE to a substring to pick one)"
+            "available output audio devices (set HOMIE_AUDIO_DEVICE to a substring to pick one)"
         );
     }
 }

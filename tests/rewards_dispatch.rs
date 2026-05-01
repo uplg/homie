@@ -5,8 +5,8 @@
 //! double-check that the action variant in `RewardsConfig` matches what
 //! the live client would translate into HTTP.
 
-use twitchy::actions;
-use twitchy::config::{Action, RewardsConfig};
+use homie::actions;
+use homie::config::{Action, RewardsConfig};
 
 const REWARDS_TOML: &str = r#"
 [[rules]]

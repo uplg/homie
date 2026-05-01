@@ -1,4 +1,4 @@
-# twitchy — project rules
+# homie — project rules
 
 ## Goal
 
@@ -40,10 +40,10 @@ A phase is only complete when all three commands pass clean. Fix clippy warnings
 ## Conventions
 
 - Errors: a single `crate::Error` (thiserror), `pub type Result<T> = std::result::Result<T, Error>`.
-- Logs: `tracing` (level via `RUST_LOG`, default `twitchy=info`).
+- Logs: `tracing` (level via `RUST_LOG`, default `homie=info`).
 - No `unwrap()` / `expect()` in the runtime path — only in `main` for fatal init errors and in tests.
 - Configuration: env (`.env` via `dotenvy`) + `config/rewards.toml`. No secret is ever logged (passwords, tokens).
-- Twitch token persisted to `<state_dir>/token.json` (default `./.twitchy/`), covered by `.gitignore`.
+- Twitch token persisted to `<state_dir>/token.json` (default `./.homie/`), covered by `.gitignore`.
 - The whole codebase, including comments and string literals, is in **English**. Reward titles in `config/rewards.toml` are the only exception: they must match exactly the strings the streamer configured on Twitch, in whatever language.
 
 ## Maison API reference
@@ -70,7 +70,7 @@ A phase is only complete when all three commands pass clean. Fix clippy warnings
 - Track downloads use the `yt-dlp` crate from the `Guilherme-j10/yt-dlp` fork (`develop` branch). Upstream `yt-dlp 2.7.x` on crates.io is broken: it transitively pins `lofty 0.23.x` which is fully yanked. Drop the git override the day a fixed crate version lands.
 - The system-installed `yt-dlp` and `ffmpeg` binaries (e.g. via `brew install`) are required at runtime; the crate calls them as subprocesses.
 - macOS coordination: pause/resume goes through `nowplaying-cli togglePlayPause` (`brew install nowplaying-cli`). That CLI calls Apple's private `MediaRemote.framework`, which is the only reliable way to operate on Now Playing from a shell. AppleScript synthetic key codes (`tell application "System Events" to key code 100`) look right but only send F8 as a regular keystroke — they never trigger media-routing. Hence the soft dep.
-- Audio output: `cpal::Device` selection by substring match against `TWITCHY_AUDIO_DEVICE` (case-insensitive). Without the env var we open the system default. Useful to route the bot through `BlackHole` so OBS can capture viewer-queue audio independently of the system mix. The bot logs available output devices at startup so the operator knows what to set.
+- Audio output: `cpal::Device` selection by substring match against `HOMIE_AUDIO_DEVICE` (case-insensitive). Without the env var we open the system default. Useful to route the bot through `BlackHole` so OBS can capture viewer-queue audio independently of the system mix. The bot logs available output devices at startup so the operator knows what to set.
 
 ## Out of scope (explicit non-goals)
 

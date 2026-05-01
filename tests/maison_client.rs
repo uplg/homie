@@ -6,7 +6,7 @@ use url::Url;
 use wiremock::matchers::{body_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use twitchy::maison::MaisonClient;
+use homie::maison::MaisonClient;
 
 const FAKE_JWT: &str = "fake.jwt.token";
 const FAKE_JWT_REFRESHED: &str = "refreshed.jwt.token";

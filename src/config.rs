@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::error::{Error, Result};
 
-const DEFAULT_STATE_DIR: &str = "./.twitchy";
+const DEFAULT_STATE_DIR: &str = "./.homie";
 const DEFAULT_REWARDS_FILE: &str = "config/rewards.toml";
 
 #[derive(Debug, Clone)]
@@ -153,18 +153,18 @@ impl EnvConfig {
         let maison_base_url = Url::parse(&required("MAISON_BASE_URL")?)?;
         let maison_username = required("MAISON_USERNAME")?;
         let maison_password = required("MAISON_PASSWORD")?;
-        let state_dir = env::var("TWITCHY_STATE_DIR")
+        let state_dir = env::var("HOMIE_STATE_DIR")
             .unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string())
             .into();
         let rewards_file = env::var("REWARDS_FILE")
             .unwrap_or_else(|_| DEFAULT_REWARDS_FILE.to_string())
             .into();
-        let audio_device = env::var("TWITCHY_AUDIO_DEVICE")
+        let audio_device = env::var("HOMIE_AUDIO_DEVICE")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
-        let initial_volume_percent = match env::var("TWITCHY_INITIAL_VOLUME") {
+        let initial_volume_percent = match env::var("HOMIE_INITIAL_VOLUME") {
             Ok(raw) => {
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
@@ -172,12 +172,12 @@ impl EnvConfig {
                 } else {
                     let parsed = trimmed.parse::<u8>().map_err(|err| {
                         Error::config(format!(
-                            "TWITCHY_INITIAL_VOLUME must be an integer 0-100: {err}"
+                            "HOMIE_INITIAL_VOLUME must be an integer 0-100: {err}"
                         ))
                     })?;
                     if parsed > 100 {
                         return Err(Error::config(
-                            "TWITCHY_INITIAL_VOLUME must be between 0 and 100",
+                            "HOMIE_INITIAL_VOLUME must be between 0 and 100",
                         ));
                     }
                     parsed
@@ -186,12 +186,12 @@ impl EnvConfig {
             Err(_) => 80,
         };
 
-        let club_url = env::var("TWITCHY_CLUB_URL")
+        let club_url = env::var("HOMIE_CLUB_URL")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
-        let discord_url = env::var("TWITCHY_DISCORD_URL")
+        let discord_url = env::var("HOMIE_DISCORD_URL")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());

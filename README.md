@@ -1,4 +1,4 @@
-# twitchy
+# homie
 
 Twitch bot that bridges **channel-point redemptions** and **chat commands** to a [Maison](https://github.com/uplg/maison) home API. Listen for redemptions over EventSub WebSocket, dispatch them to Zigbee lamps / Mitsubishi AC / Tuya pet feeder, and confirm in chat.
 
@@ -13,7 +13,7 @@ Twitch bot that bridges **channel-point redemptions** and **chat commands** to a
 - A Twitch account that owns the channel you want to drive (the broadcaster account).
 - For the music queue (`!yt`): `yt-dlp` and `ffmpeg` on the PATH. On macOS: `brew install yt-dlp ffmpeg`. The bot runs without them but `!yt` will reject submissions with a friendly error.
 - For the auto pause/resume of your music when a viewer track starts: `nowplaying-cli` on the PATH (`brew install nowplaying-cli`). Without it the bot still plays viewer tracks but won't pause anything. The bot logs a warning at startup if missing.
-- For OBS to capture the bot's audio: a virtual audio device (e.g. [BlackHole](https://github.com/ExistentialAudio/BlackHole) — `brew install blackhole-2ch`). Combine it with your usual output via *Audio MIDI Setup → New Multi-Output Device* if you also want to hear the music. Then set `TWITCHY_AUDIO_DEVICE=BlackHole` in `.env` and add a *macOS Audio Capture* / *Audio Output Capture* source in OBS pointing at BlackHole.
+- For OBS to capture the bot's audio: a virtual audio device (e.g. [BlackHole](https://github.com/ExistentialAudio/BlackHole) — `brew install blackhole-2ch`). Combine it with your usual output via *Audio MIDI Setup → New Multi-Output Device* if you also want to hear the music. Then set `HOMIE_AUDIO_DEVICE=BlackHole` in `.env` and add a *macOS Audio Capture* / *Audio Output Capture* source in OBS pointing at BlackHole.
 
 ## Configuration walkthrough
 
@@ -28,7 +28,7 @@ The bot needs three pieces of configuration:
 1. Open <https://dev.twitch.tv/console/apps> while logged in with the broadcaster account.
 2. Click **Register Your Application**.
 3. Fill the form:
-   - **Name**: anything (e.g. `twitchy-home-bot`). Must be unique on Twitch globally.
+   - **Name**: anything (e.g. `homie-home-bot`). Must be unique on Twitch globally.
    - **OAuth Redirect URLs**: Twitch requires at least one valid URL even though Device Code Flow never uses it. Put `http://localhost` and click "Add". That's enough.
    - **Category**: pick *Application Integration*.
    - **Client Type**: choose **Public**. **This is the critical setting** — Device Code Flow is only enabled for public clients. If you pick *Confidential* the bot will fail at `wait_for_code` with `invalid_client`.
@@ -75,9 +75,9 @@ MAISON_USERNAME=leonard
 MAISON_PASSWORD=the-password-you-hashed
 
 # Optional
-TWITCHY_STATE_DIR=./.twitchy
+HOMIE_STATE_DIR=./.homie
 REWARDS_FILE=config/rewards.toml
-RUST_LOG=twitchy=info
+RUST_LOG=homie=info
 ```
 
 > `TWITCH_BROADCASTER_LOGIN` is the channel login (lowercase, no spaces, what comes after `twitch.tv/`). Not the display name.
@@ -154,7 +154,7 @@ You will see something like:
 
 ```
 ────────────────────────────────────────────────────────
-  Authorise twitchy by visiting:
+  Authorise homie by visiting:
     https://www.twitch.tv/activate
   Code: ABCD-EFGH
   (valid for 30 minutes)
@@ -164,7 +164,7 @@ You will see something like:
 1. Open the URL in any browser logged in as the broadcaster account.
 2. Enter the 8-character code.
 3. Approve the scopes.
-4. Back in the bot's terminal, the device flow polls Twitch and obtains a `UserToken`. The token is written to `./.twitchy/token.json` (configurable via `TWITCHY_STATE_DIR`).
+4. Back in the bot's terminal, the device flow polls Twitch and obtains a `UserToken`. The token is written to `./.homie/token.json` (configurable via `HOMIE_STATE_DIR`).
 5. The bot then connects EventSub, registers two subscriptions (`channel.channel_points_custom_reward_redemption.add` and `channel.chat.message`), and starts dispatching.
 
 ### Subsequent runs
@@ -178,12 +178,12 @@ The bot reads the cached token. If still valid, it reuses it. If the access toke
 ## How it actually works
 
 ```
-Twitch ----WebSocket----> twitchy ----HTTP Bearer----> Maison ----> hardware
+Twitch ----WebSocket----> homie ----HTTP Bearer----> Maison ----> hardware
         EventSub          (Rust)     /api/...           backend
 ```
 
 - A single `tokio` task drives the WebSocket loop.
-- On `session_welcome`, `twitchy` calls `helix::eventsub::CreateEventSubSubscriptionRequest` twice (once for redemptions, once for chat) using the freshly received `session_id`.
+- On `session_welcome`, `homie` calls `helix::eventsub::CreateEventSubSubscriptionRequest` twice (once for redemptions, once for chat) using the freshly received `session_id`.
 - On every `notification` frame, the matching `Event` enum variant is parsed by `twitch_api`, then dispatched to `actions::execute` which translates the rule's action variant into a `MaisonClient` method call.
 - On `session_reconnect`, the loop closes the current socket and reconnects to the new URL Twitch supplied (no resubscribing needed — Twitch carries the subscriptions over).
 - On any other socket error, the loop reconnects with capped exponential backoff (1s -> 2s -> 4s ... -> 60s).

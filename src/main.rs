@@ -1,9 +1,6 @@
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
-use tokio::time::sleep;
-use tracing_subscriber::EnvFilter;
-use twitch_api::HelixClient;
-use twitchy::{
+use homie::{
     Result,
     config::AppConfig,
     error::Error,
@@ -15,6 +12,9 @@ use twitchy::{
     },
     yt_queue::{self, YtQueue},
 };
+use tokio::time::sleep;
+use tracing_subscriber::EnvFilter;
+use twitch_api::HelixClient;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -25,7 +25,7 @@ async fn main() -> ExitCode {
     match Box::pin(run()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            tracing::error!(error = %err, "twitchy stopped on error");
+            tracing::error!(error = %err, "homie stopped on error");
             ExitCode::from(1)
         }
     }
@@ -165,7 +165,7 @@ fn announce_device_code(prompt: &DevicePrompt) {
         "Twitch device code: open the URL and enter the code",
     );
     eprintln!("\n────────────────────────────────────────────────────────");
-    eprintln!("  Authorise twitchy by visiting:");
+    eprintln!("  Authorise homie by visiting:");
     eprintln!("    {}", prompt.verification_uri);
     eprintln!("  Code: {}", prompt.user_code);
     eprintln!(
@@ -183,7 +183,7 @@ fn grow_backoff(current: Duration) -> Duration {
 
 fn init_tracing() {
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("twitchy=info,warn"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("homie=info,warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

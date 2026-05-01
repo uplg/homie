@@ -1,6 +1,6 @@
 use std::fs;
 
-use twitchy::config::{Action, Matcher, RewardsConfig};
+use homie::config::{Action, Matcher, RewardsConfig};
 
 #[test]
 fn example_rewards_file_parses_cleanly() {
