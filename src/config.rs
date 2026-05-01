@@ -33,6 +33,9 @@ pub struct EnvConfig {
     /// Optional URL the `!club` chat command echoes back. When `None`, the
     /// command is disabled (no reply, not advertised in `!commands`).
     pub club_url: Option<String>,
+    /// Optional URL the `!discord` chat command echoes back. When `None`,
+    /// the command is disabled (no reply, not advertised in `!commands`).
+    pub discord_url: Option<String>,
     /// Optional OBS WebSocket configuration for the `!screen` command. When
     /// `None`, `!screen` is disabled.
     pub obs: Option<ObsConfig>,
@@ -188,6 +191,11 @@ impl EnvConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let discord_url = env::var("TWITCHY_DISCORD_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
         let obs = ObsConfig::from_env()?;
 
         Ok(Self {
@@ -201,6 +209,7 @@ impl EnvConfig {
             audio_device,
             initial_volume_percent,
             club_url,
+            discord_url,
             obs,
         })
     }

@@ -84,6 +84,7 @@ pub struct EventSubContext {
     pub yt: Arc<YtQueue>,
     pub obs: Option<Arc<crate::obs::ObsRestarter>>,
     pub club_url: Option<Arc<String>>,
+    pub discord_url: Option<Arc<String>>,
     pub state: Arc<Mutex<EventSubState>>,
 }
 
@@ -292,6 +293,7 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                         yt: ctx.yt.clone(),
                         obs: ctx.obs.clone(),
                         club_url: ctx.club_url.clone(),
+                        discord_url: ctx.discord_url.clone(),
                     },
                 )
                 .await;

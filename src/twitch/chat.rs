@@ -31,6 +31,7 @@ pub const QUEUE_BUILTIN: &str = "!queue";
 pub const VOLUME_BUILTIN: &str = "!volume";
 pub const SKIP_BUILTIN: &str = "!skip";
 pub const CLUB_BUILTIN: &str = "!club";
+pub const DISCORD_BUILTIN: &str = "!discord";
 pub const SCREEN_BUILTIN: &str = "!screen";
 
 /// Extract a `!command` from the start of a chat line.
@@ -74,9 +75,9 @@ const PUBLIC_BUILTINS: &[&str] = &[COMMANDS_BUILTIN, YT_BUILTIN, QUEUE_BUILTIN];
 const ADMIN_BUILTINS: &[&str] = &[VOLUME_BUILTIN, SKIP_BUILTIN, SCREEN_BUILTIN];
 
 fn is_builtin(command: &str) -> bool {
-    if command == CLUB_BUILTIN {
-        // !club only exists when an URL has been configured; the dispatcher
-        // checks ChatDeps before treating it as a built-in.
+    if command == CLUB_BUILTIN || command == DISCORD_BUILTIN {
+        // !club / !discord only exist when a URL has been configured; the
+        // dispatcher checks ChatDeps before treating them as built-ins.
         return false;
     }
     PUBLIC_BUILTINS.contains(&command) || ADMIN_BUILTINS.contains(&command)
@@ -92,6 +93,7 @@ pub struct ChatDeps {
     pub yt: Arc<YtQueue>,
     pub obs: Option<Arc<ObsRestarter>>,
     pub club_url: Option<Arc<String>>,
+    pub discord_url: Option<Arc<String>>,
 }
 
 /// Minimal flags driving optional built-ins in the `!commands` listing.
@@ -100,6 +102,7 @@ pub struct ChatDeps {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BuiltinFlags {
     pub club_enabled: bool,
+    pub discord_enabled: bool,
     pub screen_enabled: bool,
 }
 
@@ -107,6 +110,7 @@ impl BuiltinFlags {
     fn from_deps(deps: &ChatDeps) -> Self {
         Self {
             club_enabled: deps.club_url.is_some(),
+            discord_enabled: deps.discord_url.is_some(),
             screen_enabled: deps.obs.is_some(),
         }
     }
@@ -125,6 +129,9 @@ pub fn format_commands_list(rewards: &RewardsConfig, flags: BuiltinFlags) -> Str
     if flags.club_enabled {
         public.push(CLUB_BUILTIN);
     }
+    if flags.discord_enabled {
+        public.push(DISCORD_BUILTIN);
+    }
     if !flags.screen_enabled {
         admin.retain(|c| *c != SCREEN_BUILTIN);
     }
@@ -133,6 +140,7 @@ pub fn format_commands_list(rewards: &RewardsConfig, flags: BuiltinFlags) -> Str
         if let Matcher::ChatCommand { chat_command } = &rule.matcher {
             if is_builtin(chat_command)
                 || chat_command == CLUB_BUILTIN
+                || chat_command == DISCORD_BUILTIN
                 || chat_command == SCREEN_BUILTIN
             {
                 continue;
@@ -162,10 +170,11 @@ pub async fn dispatch(payload: &ChannelChatMessageV1Payload, deps: &ChatDeps) ->
     // !club is only a built-in when configured; otherwise fall through to
     // the user-defined rules so it can be customised in rewards.toml.
     let club_active = command == CLUB_BUILTIN && deps.club_url.is_some();
+    let discord_active = command == DISCORD_BUILTIN && deps.discord_url.is_some();
     // !screen likewise depends on OBS being configured.
     let screen_active = command == SCREEN_BUILTIN && deps.obs.is_some();
 
-    if is_builtin(command) || club_active || screen_active {
+    if is_builtin(command) || club_active || discord_active || screen_active {
         return handle_builtin(command, args, payload, deps).await;
     }
 
@@ -241,6 +250,18 @@ async fn handle_builtin(
         QUEUE_BUILTIN => handle_queue(payload, deps).await,
         CLUB_BUILTIN => {
             let Some(url) = deps.club_url.as_ref() else {
+                return Ok(());
+            };
+            send_message(
+                &deps.helix,
+                &deps.token,
+                &payload.broadcaster_user_id,
+                url.as_str(),
+            )
+            .await
+        }
+        DISCORD_BUILTIN => {
+            let Some(url) = deps.discord_url.as_ref() else {
                 return Ok(());
             };
             send_message(
@@ -549,11 +570,26 @@ mod tests {
         let cfg = RewardsConfig::parse("").unwrap();
         let flags = BuiltinFlags {
             club_enabled: true,
+            discord_enabled: false,
             screen_enabled: true,
         };
         assert_eq!(
             format_commands_list(&cfg, flags),
             "Commands: !commands, !yt, !queue, !club | Admin only: !volume, !skip, !screen"
+        );
+    }
+
+    #[test]
+    fn format_commands_list_includes_discord_when_enabled() {
+        let cfg = RewardsConfig::parse("").unwrap();
+        let flags = BuiltinFlags {
+            club_enabled: false,
+            discord_enabled: true,
+            screen_enabled: false,
+        };
+        assert_eq!(
+            format_commands_list(&cfg, flags),
+            "Commands: !commands, !yt, !queue, !discord | Admin only: !volume, !skip"
         );
     }
 

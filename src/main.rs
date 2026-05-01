@@ -52,7 +52,6 @@ async fn run() -> Result<()> {
         "configuration loaded",
     );
 
-    // 1) Maison ----------
     let maison = Arc::new(MaisonClient::new(
         &cfg.env.maison_base_url,
         cfg.env.maison_username.clone(),
@@ -61,7 +60,6 @@ async fn run() -> Result<()> {
     maison.login().await?;
     tracing::info!(base = %cfg.env.maison_base_url, "Maison login OK");
 
-    // 2) Twitch token (may block on Device Code Flow on first run) ----------
     let token = auth::acquire_user_token(&cfg.env.state_dir, &cfg.env.twitch_client_id, |prompt| {
         announce_device_code(prompt);
     })
@@ -69,7 +67,6 @@ async fn run() -> Result<()> {
     let token = Arc::new(token);
     tracing::info!(login = %token.login, "Twitch token ready");
 
-    // 3) Resolve broadcaster user_id via Helix ----------
     let helix: HelixClient<'static, reqwest::Client> = HelixClient::default();
     let broadcaster = helix
         .get_user_from_login(cfg.env.twitch_broadcaster_login.as_str(), token.as_ref())
@@ -82,9 +79,8 @@ async fn run() -> Result<()> {
             ))
         })?;
 
-    // Wipe any orphan EventSub subscriptions left by previous runs of this
-    // client_id. Done before opening the WebSocket so the bot only sees
-    // events from the subscriptions it creates this run.
+    // Wipe orphan EventSub subscriptions so the bot only sees events from
+    // subscriptions it creates this run.
     eventsub::cleanup_existing_subscriptions(&helix, token.as_ref()).await?;
 
     let yt_cache = cfg.env.state_dir.join("yt-cache");
@@ -103,8 +99,12 @@ async fn run() -> Result<()> {
         }
     }
     let club_url = cfg.env.club_url.clone().map(Arc::new);
+    let discord_url = cfg.env.discord_url.clone().map(Arc::new);
     if club_url.is_some() {
         tracing::info!("!club command enabled");
+    }
+    if discord_url.is_some() {
+        tracing::info!("!discord command enabled");
     }
 
     let ctx = EventSubContext {
@@ -116,10 +116,11 @@ async fn run() -> Result<()> {
         yt: yt.clone(),
         obs,
         club_url,
+        discord_url,
         state: Arc::new(tokio::sync::Mutex::new(eventsub::EventSubState::default())),
     };
 
-    // 4) Run EventSub loop with bounded reconnect backoff, alongside Ctrl+C ----------
+    // Run EventSub loop with bounded reconnect backoff, alongside Ctrl+C
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
@@ -139,20 +140,18 @@ async fn run() -> Result<()> {
                         tracing::info!(new_url = %new_url, "reconnecting on Twitch's request");
                         url = new_url;
                         backoff = Duration::from_secs(1);
+                        continue;
                     }
                     Ok(None) => {
                         tracing::warn!(?backoff, "session ended cleanly, reconnecting after backoff");
-                        sleep(backoff).await;
-                        backoff = grow_backoff(backoff);
-                        url = eventsub::default_websocket_url().to_string();
                     }
                     Err(err) => {
                         tracing::error!(error = %err, ?backoff, "session error, reconnecting after backoff");
-                        sleep(backoff).await;
-                        backoff = grow_backoff(backoff);
-                        url = eventsub::default_websocket_url().to_string();
                     }
                 }
+                sleep(backoff).await;
+                backoff = grow_backoff(backoff);
+                url = eventsub::default_websocket_url().to_string();
             }
         }
     }
