@@ -5,6 +5,7 @@
 //! via Helix and dispatches notifications to the rest of the bot.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -85,6 +86,7 @@ pub struct EventSubContext {
     pub obs: Option<Arc<crate::obs::ObsRestarter>>,
     pub club_url: Option<Arc<String>>,
     pub discord_url: Option<Arc<String>>,
+    pub melodie_url_file: Arc<PathBuf>,
     pub state: Arc<Mutex<EventSubState>>,
 }
 
@@ -294,6 +296,7 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                         obs: ctx.obs.clone(),
                         club_url: ctx.club_url.clone(),
                         discord_url: ctx.discord_url.clone(),
+                        melodie_url_file: ctx.melodie_url_file.clone(),
                     },
                 )
                 .await;

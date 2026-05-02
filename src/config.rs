@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 
 const DEFAULT_STATE_DIR: &str = "./.homie";
 const DEFAULT_REWARDS_FILE: &str = "config/rewards.toml";
+const DEFAULT_MELODIE_URL_FILE_REL: &str = ".melodie/live_url";
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -39,6 +40,22 @@ pub struct EnvConfig {
     /// Optional OBS WebSocket configuration for the `!screen` command. When
     /// `None`, `!screen` is disabled.
     pub obs: Option<ObsConfig>,
+    /// Path to the file the sister `melodie` project writes its current
+    /// cloudflared `*.trycloudflare.com` URL into. The `!melodie` command
+    /// reads it on every invocation; missing/empty file → friendly fallback.
+    /// Defaults to `$HOME/.melodie/live_url`.
+    pub melodie_url_file: PathBuf,
+    /// Optional loopback HTTP server config: when both fields are set, homie
+    /// spawns a tiny axum server bound to 127.0.0.1:port and accepts
+    /// `POST /push` (Bearer-auth) calls that enqueue a track in the music
+    /// queue. Used by the sister `melodie` project to push generated clips.
+    pub push: Option<PushServerConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PushServerConfig {
+    pub port: u16,
+    pub token: String,
 }
 
 /// OBS WebSocket connection details for the `!screen` capture-restart command.
@@ -198,6 +215,22 @@ impl EnvConfig {
 
         let obs = ObsConfig::from_env()?;
 
+        let melodie_url_file = match env::var("MELODIE_URL_FILE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(path) => PathBuf::from(path),
+            None => {
+                let home = env::var("HOME").map_err(|_| {
+                    Error::config("HOME is not set; set MELODIE_URL_FILE to override")
+                })?;
+                PathBuf::from(home).join(DEFAULT_MELODIE_URL_FILE_REL)
+            }
+        };
+
+        let push = PushServerConfig::from_env()?;
+
         Ok(Self {
             twitch_client_id,
             twitch_broadcaster_login,
@@ -211,7 +244,31 @@ impl EnvConfig {
             club_url,
             discord_url,
             obs,
+            melodie_url_file,
+            push,
         })
+    }
+}
+
+impl PushServerConfig {
+    /// Returns `Some(_)` when `HOMIE_PUSH_TOKEN` is set to a non-empty value
+    /// — that's the only opt-in switch. The port defaults to 7878 and is
+    /// always bound to 127.0.0.1 by the server.
+    fn from_env() -> Result<Option<Self>> {
+        let token = env::var("HOMIE_PUSH_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        let port = match env::var("HOMIE_PUSH_PORT") {
+            Ok(raw) => raw.trim().parse::<u16>().map_err(|err| {
+                Error::config(format!("HOMIE_PUSH_PORT must be a 0-65535 integer: {err}"))
+            })?,
+            Err(_) => 7878,
+        };
+        Ok(Some(Self { port, token }))
     }
 }
 

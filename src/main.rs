@@ -6,6 +6,7 @@ use homie::{
     error::Error,
     maison::MaisonClient,
     obs::ObsRestarter,
+    push_server,
     twitch::{
         auth::{self, DevicePrompt},
         eventsub::{self, EventSubContext},
@@ -107,6 +108,22 @@ async fn run() -> Result<()> {
         tracing::info!("!discord command enabled");
     }
 
+    let melodie_url_file = Arc::new(cfg.env.melodie_url_file.clone());
+    tracing::info!(
+        path = %melodie_url_file.display(),
+        "!melodie command enabled (reads URL from this file)",
+    );
+
+    if let Some(push_cfg) = cfg.env.push.clone() {
+        push_server::spawn(push_cfg, yt.clone())
+            .await
+            .map_err(|err| Error::twitch(format!("push server bind failed: {err}")))?;
+    } else {
+        tracing::info!(
+            "push server disabled (set HOMIE_PUSH_TOKEN to enable melodie's 'push to live')",
+        );
+    }
+
     let ctx = EventSubContext {
         helix,
         token: token.clone(),
@@ -117,6 +134,7 @@ async fn run() -> Result<()> {
         obs,
         club_url,
         discord_url,
+        melodie_url_file,
         state: Arc::new(tokio::sync::Mutex::new(eventsub::EventSubState::default())),
     };
 

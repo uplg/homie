@@ -30,6 +30,7 @@ cpal = "0.17.1"
 # crates.io.
 yt-dlp = { git = "https://github.com/Guilherme-j10/yt-dlp", branch = "develop" }
 obws = { version = "0.15.0", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
 [dev-dependencies]
 wiremock = "0.6.5"

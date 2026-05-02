@@ -4,6 +4,7 @@
 //! connection. The `EventSub` loop calls `parse_command` on every chat
 //! message and `dispatch` to actually run the matched rule.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use twitch_api::{
@@ -33,6 +34,7 @@ pub const SKIP_BUILTIN: &str = "!skip";
 pub const CLUB_BUILTIN: &str = "!club";
 pub const DISCORD_BUILTIN: &str = "!discord";
 pub const SCREEN_BUILTIN: &str = "!screen";
+pub const MELODIE_BUILTIN: &str = "!melodie";
 
 /// Extract a `!command` from the start of a chat line.
 ///
@@ -71,7 +73,7 @@ pub fn is_admin(badges: &[Badge]) -> bool {
 }
 
 /// Built-ins that are always available, in display order.
-const PUBLIC_BUILTINS: &[&str] = &[COMMANDS_BUILTIN, YT_BUILTIN, QUEUE_BUILTIN];
+const PUBLIC_BUILTINS: &[&str] = &[COMMANDS_BUILTIN, YT_BUILTIN, QUEUE_BUILTIN, MELODIE_BUILTIN];
 const ADMIN_BUILTINS: &[&str] = &[VOLUME_BUILTIN, SKIP_BUILTIN, SCREEN_BUILTIN];
 
 fn is_builtin(command: &str) -> bool {
@@ -94,6 +96,7 @@ pub struct ChatDeps {
     pub obs: Option<Arc<ObsRestarter>>,
     pub club_url: Option<Arc<String>>,
     pub discord_url: Option<Arc<String>>,
+    pub melodie_url_file: Arc<PathBuf>,
 }
 
 /// Minimal flags driving optional built-ins in the `!commands` listing.
@@ -297,7 +300,40 @@ async fn handle_builtin(
             }
             handle_screen(payload, deps).await
         }
+        MELODIE_BUILTIN => handle_melodie(payload, deps).await,
         _ => Ok(()),
+    }
+}
+
+async fn handle_melodie(payload: &ChannelChatMessageV1Payload, deps: &ChatDeps) -> Result<()> {
+    let reply = match read_melodie_url(deps.melodie_url_file.as_ref()).await {
+        Some(url) => url,
+        None => "no live session running right now — ask the operator".to_string(),
+    };
+    send_message(
+        &deps.helix,
+        &deps.token,
+        &payload.broadcaster_user_id,
+        &reply,
+    )
+    .await
+}
+
+async fn read_melodie_url(path: &std::path::Path) -> Option<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %path.display(), "could not read melodie live URL");
+            None
+        }
     }
 }
 
@@ -477,7 +513,8 @@ mod tests {
         assert_eq!(parse_command("!Foo"), Some("!Foo"));
     }
 
-    const BUILTINS_ONLY: &str = "Commands: !commands, !yt, !queue | Admin only: !volume, !skip";
+    const BUILTINS_ONLY: &str =
+        "Commands: !commands, !yt, !queue, !melodie | Admin only: !volume, !skip";
 
     #[test]
     fn format_commands_list_empty_config_only_builtins() {
@@ -516,7 +553,7 @@ mod tests {
         let listing = format_commands_list(&cfg, BuiltinFlags::default());
         assert_eq!(
             listing,
-            "Commands: !commands, !yt, !queue, !lamp_on, !feed_apollo \
+            "Commands: !commands, !yt, !queue, !melodie, !lamp_on, !feed_apollo \
              | Admin only: !volume, !skip, !ac_on, !ac_off"
         );
     }
@@ -538,7 +575,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             format_commands_list(&cfg, BuiltinFlags::default()),
-            "Commands: !commands, !yt, !queue, !lamp_on | Admin only: !volume, !skip"
+            "Commands: !commands, !yt, !queue, !melodie, !lamp_on | Admin only: !volume, !skip"
         );
     }
 
@@ -575,7 +612,7 @@ mod tests {
         };
         assert_eq!(
             format_commands_list(&cfg, flags),
-            "Commands: !commands, !yt, !queue, !club | Admin only: !volume, !skip, !screen"
+            "Commands: !commands, !yt, !queue, !melodie, !club | Admin only: !volume, !skip, !screen"
         );
     }
 
@@ -589,7 +626,7 @@ mod tests {
         };
         assert_eq!(
             format_commands_list(&cfg, flags),
-            "Commands: !commands, !yt, !queue, !discord | Admin only: !volume, !skip"
+            "Commands: !commands, !yt, !queue, !melodie, !discord | Admin only: !volume, !skip"
         );
     }
 
