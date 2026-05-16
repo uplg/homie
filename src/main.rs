@@ -138,7 +138,13 @@ async fn run() -> Result<()> {
         state: Arc::new(tokio::sync::Mutex::new(eventsub::EventSubState::default())),
     };
 
-    // Run EventSub loop with bounded reconnect backoff, alongside Ctrl+C
+    // Run EventSub loop with bounded reconnect backoff, alongside Ctrl+C.
+    run_eventsub_loop(&ctx, &yt).await
+}
+
+/// `EventSub` session loop: run a session, reconnect with bounded backoff,
+/// and exit cleanly on `Ctrl+C` (stopping the music worker on the way out).
+async fn run_eventsub_loop(ctx: &EventSubContext, yt: &Arc<YtQueue>) -> Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
@@ -152,7 +158,7 @@ async fn run() -> Result<()> {
                 yt.shutdown();
                 return Ok(());
             }
-            res = eventsub::run_session(&ctx, &url) => {
+            res = eventsub::run_session(ctx, &url) => {
                 match res {
                     Ok(Some(new_url)) => {
                         tracing::info!(new_url = %new_url, "reconnecting on Twitch's request");

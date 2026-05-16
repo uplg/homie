@@ -18,6 +18,11 @@ reply = "Lamp -> ON"
 match = { reward = "Nourrir Apollo" }
 action = { kind = "feeder_feed", device_id = "bf123abc456def", portion = 1 }
 reply = "Apollo is being fed!"
+
+[[rules]]
+match = { reward = "Drink some water" }
+action = { kind = "announce" }
+reply = "🥤 Time to drink some water!"
 "#;
 
 const APOLLO_REDEMPTION_FRAME: &str = r#"
@@ -98,6 +103,17 @@ fn apollo_reward_resolves_to_feeder_action() {
         }
         other => panic!("expected feeder_feed action, got {other:?}"),
     }
+}
+
+#[test]
+fn announce_reward_resolves_to_announce_action() {
+    // "À boire" is a chat-only reward: it must resolve to the Announce
+    // action (no Maison call) and carry the configured chat reply.
+    let rewards = RewardsConfig::parse(REWARDS_TOML).expect("parse rewards");
+    let rule = actions::rule_for_reward(&rewards, "Drink some water")
+        .expect("'Drink some water' rule must resolve");
+    assert_eq!(rule.action, Action::Announce);
+    assert_eq!(rule.reply.as_deref(), Some("🥤 Time to drink some water!"));
 }
 
 #[test]

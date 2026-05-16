@@ -149,6 +149,10 @@ pub enum Action {
         #[serde(default = "default_portion")]
         portion: u64,
     },
+    /// Pure chat notification — no Maison call. The chat message sent is the
+    /// rule's `reply`. Used for rewards whose only effect is to ping the
+    /// streamer in chat (e.g. a "drink some water" reminder).
+    Announce,
 }
 
 fn default_portion() -> u64 {
@@ -215,18 +219,16 @@ impl EnvConfig {
 
         let obs = ObsConfig::from_env()?;
 
-        let melodie_url_file = match env::var("MELODIE_URL_FILE")
+        let melodie_url_file = if let Some(path) = env::var("MELODIE_URL_FILE")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
         {
-            Some(path) => PathBuf::from(path),
-            None => {
-                let home = env::var("HOME").map_err(|_| {
-                    Error::config("HOME is not set; set MELODIE_URL_FILE to override")
-                })?;
-                PathBuf::from(home).join(DEFAULT_MELODIE_URL_FILE_REL)
-            }
+            PathBuf::from(path)
+        } else {
+            let home = env::var("HOME")
+                .map_err(|_| Error::config("HOME is not set; set MELODIE_URL_FILE to override"))?;
+            PathBuf::from(home).join(DEFAULT_MELODIE_URL_FILE_REL)
         };
 
         let push = PushServerConfig::from_env()?;
@@ -463,6 +465,25 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_announce_action() {
+        let toml_input = r#"
+            [[rules]]
+            match = { reward = "Drink some water" }
+            action = { kind = "announce" }
+            reply = "time to hydrate"
+        "#;
+        let cfg = RewardsConfig::parse(toml_input).expect("parse");
+        assert_eq!(cfg.rules[0].action, Action::Announce);
+        assert_eq!(cfg.rules[0].reply.as_deref(), Some("time to hydrate"));
+        assert_eq!(
+            cfg.rules[0].matcher,
+            Matcher::Reward {
+                reward: "Drink some water".into()
+            }
+        );
     }
 
     #[test]

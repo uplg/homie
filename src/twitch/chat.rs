@@ -224,7 +224,7 @@ pub async fn dispatch(payload: &ChannelChatMessageV1Payload, deps: &ChatDeps) ->
     Ok(())
 }
 
-fn effective_reply<'a>(rule: &'a Rule, fallback: &'a str) -> Option<&'a str> {
+pub(crate) fn effective_reply<'a>(rule: &'a Rule, fallback: &'a str) -> Option<&'a str> {
     match rule.reply.as_deref() {
         Some(text) if !text.is_empty() => Some(text),
         Some(_) => None, // explicit empty string disables reply
@@ -466,7 +466,7 @@ async fn handle_screen(payload: &ChannelChatMessageV1Payload, deps: &ChatDeps) -
     .await
 }
 
-async fn send_message(
+pub(crate) async fn send_message(
     helix: &HelixClient<'static, reqwest::Client>,
     token: &UserToken,
     broadcaster: &UserId,

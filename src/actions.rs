@@ -70,5 +70,39 @@ pub async fn execute(rule: &Rule, maison: &Arc<MaisonClient>) -> Result<String> 
             let resp = maison.feeder_feed(device_id, *portion).await?;
             Ok(resp.message)
         }
+        // No Maison side effect: the chat reply *is* the action. Returning
+        // an empty string lets `effective_reply` fall back to the rule's
+        // `reply` (which an `announce` rule is expected to set).
+        Action::Announce => Ok(String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Action, Matcher, Rule};
+    use url::Url;
+
+    #[tokio::test]
+    async fn announce_action_returns_empty_and_makes_no_maison_call() {
+        // Unreachable address: if `execute` tried to reach Maison the test
+        // would hang/error. It must not for an announce action.
+        let maison = Arc::new(
+            MaisonClient::new(
+                &Url::parse("http://127.0.0.1:1/").unwrap(),
+                "u".to_string(),
+                "p".to_string(),
+            )
+            .unwrap(),
+        );
+        let rule = Rule {
+            matcher: Matcher::Reward {
+                reward: "Drink some water".to_string(),
+            },
+            action: Action::Announce,
+            reply: Some("drink some water".to_string()),
+            admin_only: false,
+        };
+        assert_eq!(execute(&rule, &maison).await.unwrap(), "");
     }
 }

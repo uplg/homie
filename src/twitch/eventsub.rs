@@ -324,8 +324,29 @@ async fn handle_redemption(
     };
 
     match actions::execute(rule, &ctx.maison).await {
-        Ok(message) => tracing::info!(reward = %title, %message, "action executed"),
-        Err(err) => tracing::error!(reward = %title, error = %err, "action failed"),
+        Ok(message) => {
+            tracing::info!(reward = %title, %message, "action executed");
+            // Mirror the chat-command behaviour: confirm in chat. For an
+            // `announce` action this *is* the whole point (the streamer
+            // watches chat); for the others it's a nice acknowledgement.
+            if let Some(reply) = chat::effective_reply(rule, &message) {
+                if !reply.is_empty() {
+                    chat::send_message(&ctx.helix, &ctx.token, &ctx.broadcaster_user_id, reply)
+                        .await?;
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!(reward = %title, error = %err, "action failed");
+            chat::send_message(
+                &ctx.helix,
+                &ctx.token,
+                &ctx.broadcaster_user_id,
+                &format!("⚠ {title}: {err}"),
+            )
+            .await
+            .ok();
+        }
     }
     Ok(())
 }

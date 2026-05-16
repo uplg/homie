@@ -7,6 +7,8 @@
 #
 # `admin_only = true` (default false) restricts a chat command to broadcaster/moderator badges.
 # `reply` is the chat confirmation message; if omitted, the Maison response message is echoed.
+# `action = { kind = "announce" }` does nothing on Maison: it only posts `reply`
+# in chat (e.g. a channel-point reward that is just a heads-up for the streamer).
 #
 # The bot ships with a built-in `!commands` that lists every chat_command rule defined here
 # (split between public and admin-only). You don't need to declare it.
@@ -48,3 +50,10 @@ match = { chat_command = "!ac_off" }
 admin_only = true
 action = { kind = "ac_mitsubishi", host = "192.168.1.42", command = "power_off", model = "msz" }
 reply = "AC -> OFF"
+
+# --- Channel-point reward, chat-only (no Maison call) ---
+# The `reward` title must match the Twitch reward *exactly* (case-sensitive).
+[[rules]]
+match = { reward = "Drink some water" }
+action = { kind = "announce" }
+reply = "🥤 Time to drink some water!"

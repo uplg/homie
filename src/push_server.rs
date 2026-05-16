@@ -174,10 +174,7 @@ mod tests {
         assert!(auth_ok(&headers, "secret"));
 
         let mut bare = HeaderMap::new();
-        bare.insert(
-            axum::http::header::AUTHORIZATION,
-            "secret".parse().unwrap(),
-        );
+        bare.insert(axum::http::header::AUTHORIZATION, "secret".parse().unwrap());
         assert!(!auth_ok(&bare, "secret"));
 
         assert!(!auth_ok(&HeaderMap::new(), "secret"));
