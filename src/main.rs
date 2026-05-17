@@ -284,6 +284,27 @@ fn grow_backoff(current: Duration) -> Duration {
     if doubled > MAX { MAX } else { doubled }
 }
 
+/// Short, fixed UTC+2 log timestamp (`HH:MM:SS`) — no date, no sub-seconds,
+/// no `Z`. UTC+2 is a fixed offset (no DST handling), as requested.
+struct LocalShortTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalShortTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let local = secs.saturating_add(2 * 3600); // UTC+2
+        let day = local % 86_400;
+        write!(
+            w,
+            "{:02}:{:02}:{:02}",
+            day / 3600,
+            (day % 3600) / 60,
+            day % 60
+        )
+    }
+}
+
 /// Initialise `tracing`. In TUI mode the fmt layer writes (ANSI-free) into a
 /// [`LogBuffer`] the dashboard renders, instead of stdout (which the TUI
 /// owns). Returns that buffer iff TUI mode is on.
@@ -306,6 +327,7 @@ fn init_tracing(tui: bool) -> Option<LogBuffer> {
     };
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_timer(LocalShortTime)
         .with_target(false);
 
     if tui {

@@ -202,28 +202,19 @@ impl Panel {
         self.lines.push_back(line);
     }
 
-    /// Lines to draw for an inner viewport of `height` rows.
-    fn visible(&self, height: usize) -> Vec<ListItem<'static>> {
-        let len = self.lines.len();
-        let back = self.scroll_back.min(len.saturating_sub(1));
-        let end = len.saturating_sub(back);
-        let start = end.saturating_sub(height);
-        self.lines
-            .iter()
-            .skip(start)
-            .take(end - start)
-            .cloned()
-            .map(ListItem::new)
-            .collect()
+    /// Items to draw for an inner viewport of `width`×`height`, with long
+    /// lines wrapped (never truncated) and the newest content tailed.
+    fn visible(&self, width: usize, height: usize) -> Vec<ListItem<'static>> {
+        windowed(&self.lines, width, height, self.scroll_back)
     }
 
     fn scroll(&mut self, delta: isize) {
-        let max = self.lines.len().saturating_sub(1);
+        // scroll_back counts *visual* rows; a logical line may wrap to
+        // several, so cap generously (the renderer clamps to what's
+        // actually there). 8× the logical count is plenty of headroom.
+        let max = self.lines.len().saturating_mul(8);
         if delta < 0 {
-            self.scroll_back = self
-                .scroll_back
-                .saturating_sub(delta.unsigned_abs())
-                .min(max);
+            self.scroll_back = self.scroll_back.saturating_sub(delta.unsigned_abs());
         } else {
             self.scroll_back = (self.scroll_back + usize::try_from(delta).unwrap_or(0)).min(max);
         }
@@ -363,18 +354,26 @@ impl App {
         } else {
             format!(" Chat  [↑{} — End=live] ", self.chat.scroll_back)
         };
-        render_panel(frame, top[0], &chat_title, self.chat.visible(rows(top[0])));
+        render_panel(
+            frame,
+            top[0],
+            &chat_title,
+            self.chat.visible(cols(top[0]), rows(top[0])),
+        );
         render_panel(
             frame,
             top[1],
             " Activity ",
-            self.activity.visible(rows(top[1])),
+            self.activity.visible(cols(top[1]), rows(top[1])),
         );
 
-        let log_rows = rows(outer[1]);
-        let logs = self.logs.snapshot();
-        let start = logs.len().saturating_sub(log_rows);
-        let log_items: Vec<ListItem> = logs[start..].iter().map(|l| log_line(l)).collect();
+        let logs: VecDeque<Line<'static>> = self
+            .logs
+            .snapshot()
+            .iter()
+            .map(|l| log_to_line(l))
+            .collect();
+        let log_items = windowed(&logs, cols(outer[1]), rows(outer[1]), 0);
         render_panel(
             frame,
             outer[1],
@@ -389,13 +388,86 @@ fn rows(area: ratatui::layout::Rect) -> usize {
     usize::from(area.height.saturating_sub(2))
 }
 
+/// Inner (border-excluded) column count of a rect.
+fn cols(area: ratatui::layout::Rect) -> usize {
+    usize::from(area.width.saturating_sub(2))
+}
+
+/// Hard-wrap one styled line to `width` columns, preserving per-span style.
+/// One char = one column (good enough for chat/logs; a couple of wide
+/// emojis in markers may be off by one, never truncated).
+fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line.clone()];
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    for span in &line.spans {
+        let style = span.style;
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            if col == width {
+                if !chunk.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                out.push(Line::from(std::mem::take(&mut cur)));
+                col = 0;
+            }
+            chunk.push(ch);
+            col += 1;
+        }
+        if !chunk.is_empty() {
+            cur.push(Span::styled(chunk, style));
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(Line::from(cur));
+    }
+    out
+}
+
+/// Wrap `lines` to `width`, then return the `height` visual rows ending
+/// `scroll_back` rows above the live tail. Only the tail is wrapped, so
+/// cost is bounded by the viewport, not the buffer.
+fn windowed(
+    lines: &VecDeque<Line<'static>>,
+    width: usize,
+    height: usize,
+    scroll_back: usize,
+) -> Vec<ListItem<'static>> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let need = height + scroll_back + 1;
+    let mut rows_buf: VecDeque<Line<'static>> = VecDeque::new();
+    for line in lines.iter().rev() {
+        for row in wrap_line(line, width).into_iter().rev() {
+            rows_buf.push_front(row);
+        }
+        if rows_buf.len() >= need {
+            break;
+        }
+    }
+    let len = rows_buf.len();
+    let back = scroll_back.min(len.saturating_sub(1));
+    let end = len.saturating_sub(back);
+    let start = end.saturating_sub(height);
+    rows_buf
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .map(ListItem::new)
+        .collect()
+}
+
 fn render_panel(frame: &mut Frame, area: ratatui::layout::Rect, title: &str, items: Vec<ListItem>) {
     let list = List::new(items).block(Block::bordered().title(title.to_string()));
     frame.render_widget(list, area);
 }
 
 /// Colourise a captured tracing line by its level token.
-fn log_line(raw: &str) -> ListItem<'static> {
+fn log_to_line(raw: &str) -> Line<'static> {
     let color = if raw.contains("ERROR") {
         Color::Red
     } else if raw.contains(" WARN") {
@@ -405,10 +477,7 @@ fn log_line(raw: &str) -> ListItem<'static> {
     } else {
         Color::Gray
     };
-    ListItem::new(Line::from(Span::styled(
-        raw.to_string(),
-        Style::default().fg(color),
-    )))
+    Line::from(Span::styled(raw.to_string(), Style::default().fg(color)))
 }
 
 /// Restores the terminal on drop — even if the render loop panics — and
@@ -529,21 +598,59 @@ mod tests {
         for i in 0..10 {
             p.push(Line::from(i.to_string()));
         }
-        // A 3-row viewport with no scroll shows the last 3 lines.
-        assert_eq!(p.visible(3).len(), 3);
+        // A 20×3 viewport, short lines (no wrap), no scroll → last 3 lines.
+        assert_eq!(p.visible(20, 3).len(), 3);
         assert_eq!(p.scroll_back, 0);
     }
 
     #[test]
-    fn panel_scroll_clamps_both_ends() {
+    fn panel_scroll_clamps_low_and_caps_high() {
         let mut p = Panel::new();
         for i in 0..5 {
             p.push(Line::from(i.to_string()));
         }
-        p.scroll(-100); // below zero clamps to 0
+        p.scroll(-100); // can't go below the live tail
         assert_eq!(p.scroll_back, 0);
-        p.scroll(100); // above len-1 clamps
-        assert_eq!(p.scroll_back, 4);
+        p.scroll(100); // capped at lines.len() * 8
+        assert_eq!(p.scroll_back, 40);
+    }
+
+    fn text_of(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrap_line_hard_wraps_and_preserves_text() {
+        let line = Line::from("abcdefghij".to_string());
+        let rows = wrap_line(&line, 4);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(text_of(&rows[0]), "abcd");
+        assert_eq!(text_of(&rows[1]), "efgh");
+        assert_eq!(text_of(&rows[2]), "ij");
+    }
+
+    #[test]
+    fn wrap_line_splits_across_spans_keeping_styles() {
+        let line = Line::from(vec![
+            Span::styled("ab", Style::default().fg(Color::Red)),
+            Span::styled("cdef", Style::default().fg(Color::Blue)),
+        ]);
+        let rows = wrap_line(&line, 3);
+        // "abc" then "def"
+        assert_eq!(rows.len(), 2);
+        assert_eq!(text_of(&rows[0]), "abc");
+        assert_eq!(text_of(&rows[1]), "def");
+        // First row keeps both colours (a,b red — c blue).
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(rows[0].spans[1].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn windowed_tails_wrapped_rows() {
+        let mut dq: VecDeque<Line<'static>> = VecDeque::new();
+        dq.push_back(Line::from("abcdefghij".to_string())); // 3 rows at width 4
+        // height 2 → only the last two wrapped rows are shown, never truncated.
+        assert_eq!(windowed(&dq, 4, 2, 0).len(), 2);
     }
 
     #[test]
