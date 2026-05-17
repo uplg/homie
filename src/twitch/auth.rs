@@ -25,12 +25,12 @@ const MIN_REMAINING_LIFETIME_SECS: u64 = 60;
 
 /// Scopes required by the bot.
 ///
-/// `ChannelReadSubscriptions` and `ModeratorReadFollowers` only feed the
-/// optional TUI dashboard's Activity panel (sub/follow alerts). They are
-/// requested unconditionally so a single device-code authorisation covers
-/// every feature; the matching `EventSub` subscriptions are best-effort, so
-/// a token granted before these scopes were added keeps working (those
-/// alerts just won't appear until the operator re-authorises).
+/// `ChannelReadSubscriptions`/`ModeratorReadFollowers` feed the TUI Activity
+/// panel; `ChannelManageBroadcast` lets homie set the stream title from the
+/// startup prompt. All are requested unconditionally so a single device-code
+/// authorisation covers every feature; the dependent calls are best-effort,
+/// so a token granted before a scope was added keeps working (that feature
+/// just stays inert until the operator re-authorises).
 #[must_use]
 pub fn required_scopes() -> Vec<Scope> {
     vec![
@@ -41,6 +41,7 @@ pub fn required_scopes() -> Vec<Scope> {
         Scope::ChannelBot,
         Scope::ChannelReadSubscriptions,
         Scope::ModeratorReadFollowers,
+        Scope::ChannelManageBroadcast,
     ]
 }
 
@@ -267,5 +268,7 @@ mod tests {
         // TUI Activity panel feeds (best-effort EventSub subscriptions).
         assert!(scopes.contains(&Scope::ChannelReadSubscriptions));
         assert!(scopes.contains(&Scope::ModeratorReadFollowers));
+        // Startup title-edit prompt.
+        assert!(scopes.contains(&Scope::ChannelManageBroadcast));
     }
 }

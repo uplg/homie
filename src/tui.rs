@@ -34,6 +34,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, List, ListItem},
 };
+use serde::Deserialize;
 use tokio::sync::{broadcast, watch};
 
 /// Max lines kept per panel (older lines are evicted).
@@ -76,6 +77,8 @@ pub enum UiEvent {
     Follow { user: String },
     /// An incoming raid.
     Raid { from: String, viewers: i64 },
+    /// A spotlight notice (e.g. the configured zoom user is speaking).
+    Notice { text: String },
 }
 
 /// Shared, bounded ring of formatted log lines plus an "active" flag.
@@ -315,6 +318,16 @@ impl App {
                 Color::LightRed,
                 format!("{from} raided with {viewers} viewer(s)"),
             )),
+            UiEvent::Notice { text } => {
+                let style = Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                self.activity.push(Line::from(vec![
+                    Span::styled("‼ ", style),
+                    Span::styled(text, style),
+                ]));
+            }
         }
     }
 
@@ -346,7 +359,7 @@ impl App {
 
         let top = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
             .split(outer[0]);
 
         let chat_title = if self.chat.scroll_back == 0 {
@@ -525,6 +538,7 @@ impl Drop for SignalOnDrop {
 /// of these (see [`SignalOnDrop`]).
 pub fn run(
     mut events: broadcast::Receiver<UiEvent>,
+    prefill: Vec<UiEvent>,
     logs: LogBuffer,
     shutdown: Arc<watch::Sender<bool>>,
 ) -> io::Result<()> {
@@ -541,6 +555,10 @@ pub fn run(
     let _guard = TerminalGuard::enter(logs.clone())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::new(logs);
+    // Recent-chat history (best-effort) so the Chat panel isn't empty.
+    for ev in prefill {
+        app.ingest(ev);
+    }
     let mut shutdown_rx = stop.0.subscribe();
 
     while !app.quit {
@@ -576,6 +594,99 @@ pub fn run(
     }
 
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct RecentMessages {
+    messages: Vec<String>,
+}
+
+/// Best-effort fetch of the channel's recent chat to prefill the Chat panel.
+///
+/// Uses the community `recent-messages.robotty.de` service (the same one
+/// Chatterino uses) — Twitch has no first-party recent-chat API. Returns an
+/// empty vec on any failure; never fatal. Third-party network dependency:
+/// if it's down, the panel just starts empty.
+pub async fn fetch_recent_chat(login: &str, limit: usize) -> Vec<UiEvent> {
+    let url = format!(
+        "https://recent-messages.robotty.de/api/v2/recent-messages/{login}\
+         ?limit={limit}&hide_moderation_messages=true&hide_moderated_messages=true"
+    );
+    let Ok(client) = reqwest::Client::builder().build() else {
+        return Vec::new();
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!(status = %r.status(), "recent-messages HTTP error");
+            return Vec::new();
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "recent-messages fetch failed");
+            return Vec::new();
+        }
+    };
+    match resp.json::<RecentMessages>().await {
+        Ok(parsed) => parsed
+            .messages
+            .iter()
+            .filter_map(|line| parse_privmsg(line))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(error = %err, "recent-messages decode failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Parse one raw IRC line into a [`UiEvent::Chat`], or `None` if it isn't a
+/// usable `PRIVMSG`. Handles the optional `IRCv3` `@tags` prefix.
+fn parse_privmsg(raw: &str) -> Option<UiEvent> {
+    let (tags, rest) = match raw.strip_prefix('@') {
+        Some(stripped) => {
+            let (t, r) = stripped.split_once(' ')?;
+            (Some(t), r)
+        }
+        None => (None, raw),
+    };
+    let rest = rest.strip_prefix(':')?;
+    let (prefix, after) = rest.split_once(' ')?;
+    let mut parts = after.splitn(3, ' ');
+    if parts.next()? != "PRIVMSG" {
+        return None;
+    }
+    let _channel = parts.next()?;
+    let text = parts
+        .next()?
+        .strip_prefix(':')
+        .unwrap_or("")
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+
+    let nick = prefix.split('!').next().unwrap_or(prefix);
+    let mut user = nick.to_string();
+    let mut privileged = false;
+    if let Some(tags) = tags {
+        for kv in tags.split(';') {
+            match kv.split_once('=') {
+                Some(("display-name", v)) if !v.is_empty() => user = v.to_string(),
+                Some(("badges", v)) => {
+                    privileged = v
+                        .split(',')
+                        .any(|b| b.starts_with("broadcaster/") || b.starts_with("moderator/"));
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(UiEvent::Chat {
+        user,
+        privileged,
+        text,
+    })
 }
 
 #[cfg(test)]
@@ -643,6 +754,37 @@ mod tests {
         // First row keeps both colours (a,b red — c blue).
         assert_eq!(rows[0].spans[0].style.fg, Some(Color::Red));
         assert_eq!(rows[0].spans[1].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn parse_privmsg_extracts_name_badges_text() {
+        let raw = "@badge-info=;badges=moderator/1;display-name=Xefreh;mod=1 \
+                   :xefreh!xefreh@xefreh.tmi.twitch.tv PRIVMSG #chan :hello there";
+        match parse_privmsg(raw) {
+            Some(UiEvent::Chat {
+                user,
+                privileged,
+                text,
+            }) => {
+                assert_eq!(user, "Xefreh");
+                assert!(privileged);
+                assert_eq!(text, "hello there");
+            }
+            other => panic!("expected a Chat event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_privmsg_ignores_non_privmsg_and_untagged() {
+        assert!(parse_privmsg(":tmi.twitch.tv 001 nick :Welcome").is_none());
+        // No tags, plain PRIVMSG → falls back to the nick.
+        match parse_privmsg(":bob!bob@bob.tmi.twitch.tv PRIVMSG #c :hi") {
+            Some(UiEvent::Chat { user, text, .. }) => {
+                assert_eq!(user, "bob");
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
     }
 
     #[test]

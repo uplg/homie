@@ -6,7 +6,7 @@ use homie::{
     error::Error,
     maison::MaisonClient,
     obs::ObsRestarter,
-    push_server,
+    push_server, title_prompt,
     tui::{self, LogBuffer, UiEvent},
     twitch::{
         auth::{self, DevicePrompt},
@@ -19,7 +19,10 @@ use tokio::{
     time::sleep,
 };
 use tracing_subscriber::EnvFilter;
-use twitch_api::HelixClient;
+use twitch_api::{
+    HelixClient,
+    helix::channels::{ModifyChannelInformationBody, ModifyChannelInformationRequest},
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -78,7 +81,23 @@ async fn run(log_buf: Option<LogBuffer>) -> Result<()> {
         .then(|| broadcast::channel::<UiEvent>(1024).0);
 
     let (ctx, yt) = Box::pin(assemble(&cfg, ui_tx.clone())).await?;
-    Box::pin(drive(ctx, yt, log_buf, ui_tx)).await
+
+    // Go-live: if the channel is already live, notify once (marker-guarded);
+    // the stream.online subscription handles the later transition.
+    Box::pin(eventsub::notify_if_live_now(&ctx)).await;
+
+    // Best-effort recent-chat history to prefill the dashboard's Chat panel.
+    let prefill = if log_buf.is_some() {
+        Box::pin(tui::fetch_recent_chat(
+            &cfg.env.twitch_broadcaster_login,
+            80,
+        ))
+        .await
+    } else {
+        Vec::new()
+    };
+
+    Box::pin(drive(ctx, yt, log_buf, ui_tx, prefill)).await
 }
 
 /// Build every runtime dependency and the `EventSub` context. Performs the
@@ -114,6 +133,10 @@ async fn assemble(
                 cfg.env.twitch_broadcaster_login
             ))
         })?;
+
+    // Optional: let the operator edit the Twitch stream title before going
+    // live. Best-effort; runs before the go-live notification reads it.
+    maybe_edit_title(cfg, &helix, token.as_ref(), &broadcaster).await;
 
     // Wipe orphan EventSub subscriptions so the bot only sees events from
     // subscriptions it creates this run.
@@ -159,6 +182,21 @@ async fn assemble(
         );
     }
 
+    let discord = cfg
+        .env
+        .discord_webhook_url
+        .clone()
+        .map(|url| eventsub::DiscordNotify {
+            webhook_url: Arc::new(url),
+            live_title: cfg.env.live_title.clone().map(Arc::new),
+            broadcaster_login: Arc::new(cfg.env.twitch_broadcaster_login.clone()),
+            marker_file: Arc::new(cfg.env.state_dir.join("last_live")),
+        });
+    let zoom_user = cfg.env.zoom_user.clone().map(Arc::new);
+    let zoom_marker = zoom_user
+        .as_ref()
+        .map(|_| Arc::new(cfg.env.state_dir.join("last_zoom")));
+
     let ctx = EventSubContext {
         helix,
         token: token.clone(),
@@ -172,8 +210,66 @@ async fn assemble(
         melodie_url_file,
         state: Arc::new(tokio::sync::Mutex::new(eventsub::EventSubState::default())),
         events,
+        discord,
+        zoom_user,
+        zoom_marker,
     };
     Ok((ctx, yt))
+}
+
+/// Optional startup title editor (`HOMIE_TITLE_PROMPT`). Infallible by
+/// design: fetch-title, the interactive prompt, and the PATCH are all
+/// best-effort and logged, never blocking startup.
+async fn maybe_edit_title(
+    cfg: &AppConfig,
+    helix: &HelixClient<'static, reqwest::Client>,
+    token: &twitch_oauth2::UserToken,
+    broadcaster: &twitch_api::helix::users::User,
+) {
+    if !cfg.env.title_prompt {
+        return;
+    }
+    let current = match helix.get_channel_from_id(&broadcaster.id, token).await {
+        Ok(Some(ch)) => ch.title,
+        Ok(None) => String::new(),
+        Err(err) => {
+            tracing::warn!(error = %err, "title prompt: could not fetch current title");
+            return;
+        }
+    };
+    let for_prompt = current.clone();
+    let edited = match tokio::task::spawn_blocking(move || title_prompt::prompt(&for_prompt)).await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "title prompt failed");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "title prompt task panicked");
+            return;
+        }
+    };
+    let Some(new_title) = edited else {
+        tracing::info!("stream title kept (prompt dismissed)");
+        return;
+    };
+    let new_title = new_title.trim();
+    if new_title.is_empty() || new_title == current {
+        tracing::info!("stream title unchanged");
+        return;
+    }
+    let req = ModifyChannelInformationRequest::broadcaster_id(&broadcaster.id);
+    let mut body = ModifyChannelInformationBody::new();
+    body.title(new_title.to_string());
+    match helix.req_patch(req, body, token).await {
+        Ok(_) => tracing::info!(title = %new_title, "Twitch stream title updated"),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "could not set stream title (needs scope channel:manage:broadcast — \
+             delete .homie/token.json and restart to re-authorise)"
+        ),
+    }
 }
 
 /// Headless: just run the `EventSub` loop. TUI mode: spawn the dashboard on
@@ -184,6 +280,7 @@ async fn drive(
     yt: Arc<YtQueue>,
     log_buf: Option<LogBuffer>,
     ui_tx: Option<broadcast::Sender<UiEvent>>,
+    prefill: Vec<UiEvent>,
 ) -> Result<()> {
     let shutdown = Arc::new(watch::channel(false).0);
     match (log_buf, ui_tx) {
@@ -191,7 +288,7 @@ async fn drive(
             let rx = tx.subscribe();
             let sd = shutdown.clone();
             tracing::info!("starting TUI dashboard (press q or Esc to quit)");
-            let ui = std::thread::spawn(move || tui::run(rx, buf, sd));
+            let ui = std::thread::spawn(move || tui::run(rx, prefill, buf, sd));
             let result = Box::pin(run_eventsub_loop(ctx, yt, shutdown.clone())).await;
             // Whatever stopped the loop, make sure the dashboard stops too.
             let _ = shutdown.send(true);

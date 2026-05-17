@@ -13,6 +13,9 @@ pub enum Error {
     #[error("Twitch error: {0}")]
     Twitch(String),
 
+    #[error("Discord webhook error: {0}")]
+    Discord(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -40,5 +43,9 @@ impl Error {
 
     pub fn twitch(msg: impl Into<String>) -> Self {
         Self::Twitch(msg.into())
+    }
+
+    pub fn discord(msg: impl Into<String>) -> Self {
+        Self::Discord(msg.into())
     }
 }

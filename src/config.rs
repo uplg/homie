@@ -37,6 +37,19 @@ pub struct EnvConfig {
     /// Optional URL the `!discord` chat command echoes back. When `None`,
     /// the command is disabled (no reply, not advertised in `!commands`).
     pub discord_url: Option<String>,
+    /// Optional Discord webhook URL. When set, homie posts a "went live"
+    /// notification when the stream goes online. `None` disables it.
+    pub discord_webhook_url: Option<String>,
+    /// Optional override for the live *title* shown in the go-live
+    /// notification. When `None`, the current Twitch stream title is used.
+    pub live_title: Option<String>,
+    /// Optional username (login or display name, case-insensitive). When
+    /// that user speaks in chat, the TUI shows a "Please zoom for <name>"
+    /// notice. `None` disables the feature.
+    pub zoom_user: Option<String>,
+    /// When true (`HOMIE_TITLE_PROMPT`), homie shows an editable, dismissible
+    /// prompt at startup prefilled with the current Twitch stream title.
+    pub title_prompt: bool,
     /// Optional OBS WebSocket configuration for the `!screen` command. When
     /// `None`, `!screen` is disabled.
     pub obs: Option<ObsConfig>,
@@ -217,6 +230,28 @@ impl EnvConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let discord_webhook_url = env::var("HOMIE_DISCORD_WEBHOOK_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let live_title = env::var("HOMIE_LIVE_TITLE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let zoom_user = env::var("HOMIE_ZOOM_USER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let title_prompt = env::var("HOMIE_TITLE_PROMPT").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+
         let obs = ObsConfig::from_env()?;
 
         let melodie_url_file = if let Some(path) = env::var("MELODIE_URL_FILE")
@@ -245,6 +280,10 @@ impl EnvConfig {
             initial_volume_percent,
             club_url,
             discord_url,
+            discord_webhook_url,
+            live_title,
+            zoom_user,
+            title_prompt,
             obs,
             melodie_url_file,
             push,

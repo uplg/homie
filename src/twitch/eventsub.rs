@@ -20,10 +20,14 @@ use twitch_api::{
             ChannelRaidV1, ChannelSubscribeV1, ChannelSubscriptionGiftV1,
             ChannelSubscriptionMessageV1,
         },
+        stream::StreamOnlineV1,
     },
-    helix::eventsub::{
-        CreateEventSubSubscriptionRequest, DeleteEventSubSubscriptionRequest,
-        GetEventSubSubscriptionsRequest,
+    helix::{
+        eventsub::{
+            CreateEventSubSubscriptionRequest, DeleteEventSubSubscriptionRequest,
+            GetEventSubSubscriptionsRequest,
+        },
+        streams::GetStreamsRequest,
     },
     types::{SubscriptionTier, UserId},
 };
@@ -56,6 +60,13 @@ const SEEN_MESSAGE_CAPACITY: usize = 256;
 pub struct EventSubState {
     subscribed_session_id: Option<String>,
     seen_message_ids: VecDeque<String>,
+    /// In-memory "zoom notice already fired" guard, used only when the live
+    /// id is unknown (no `stream.online`/startup live-check this run).
+    zoom_notice_sent: bool,
+    /// Current live's stream id, learned from `stream.online` or the startup
+    /// live-check. Keys the on-disk zoom marker so the notice fires once per
+    /// live even across a bot restart.
+    current_live: Option<String>,
 }
 
 impl EventSubState {
@@ -77,6 +88,23 @@ impl EventSubState {
         self.seen_message_ids.push_back(message_id.to_string());
         true
     }
+
+    /// Returns `true` exactly once per live for the zoom-user notice; marks
+    /// it sent so subsequent messages this live don't repeat it.
+    fn claim_zoom_notice(&mut self) -> bool {
+        if self.zoom_notice_sent {
+            return false;
+        }
+        self.zoom_notice_sent = true;
+        true
+    }
+
+    /// A live started/was detected: record its id and re-arm the in-memory
+    /// guard so the zoom notice can fire once for this new live.
+    fn start_live(&mut self, stream_id: &str) {
+        self.current_live = Some(stream_id.to_string());
+        self.zoom_notice_sent = false;
+    }
 }
 
 /// Shared dependencies the WS loop needs at runtime.
@@ -96,6 +124,26 @@ pub struct EventSubContext {
     /// When `Some` (TUI mode), observable events are mirrored here for the
     /// dashboard. `None` in headless mode — emission is then a no-op.
     pub events: Option<broadcast::Sender<UiEvent>>,
+    /// Go-live Discord notification config; `None` disables it.
+    pub discord: Option<DiscordNotify>,
+    /// Optional user to spotlight with a "Please zoom" notice when they
+    /// speak (matched case-insensitively on login or display name).
+    pub zoom_user: Option<Arc<String>>,
+    /// File recording the live id the zoom notice last fired for, so it
+    /// stays once-per-live across bot restarts. `Some` iff `zoom_user`.
+    pub zoom_marker: Option<Arc<PathBuf>>,
+}
+
+/// Everything needed to post (and de-duplicate) the go-live webhook.
+#[derive(Clone)]
+pub struct DiscordNotify {
+    pub webhook_url: Arc<String>,
+    /// Overrides the live title shown in the embed when set.
+    pub live_title: Option<Arc<String>>,
+    pub broadcaster_login: Arc<String>,
+    /// Holds the last-notified stream id, so a bot restart during the same
+    /// live (or offline dev work) never re-notifies.
+    pub marker_file: Arc<PathBuf>,
 }
 
 /// Best-effort mirror of an observable event to the TUI. A slow/absent
@@ -285,6 +333,19 @@ async fn create_subscriptions(ctx: &EventSubContext, session_id: &str) -> Result
         .map_err(|err| Error::twitch(format!("create chat subscription: {err}")))?;
     tracing::info!("subscribed to channel.chat.message");
 
+    // Go-live: stream.online (no scope required). Lets the operator start
+    // homie before the live without spamming, and only fires on the real
+    // transition. Best-effort.
+    if ctx.discord.is_some() {
+        try_subscribe(
+            ctx,
+            &transport,
+            StreamOnlineV1::broadcaster_user_id(ctx.broadcaster_user_id.clone()),
+            "stream.online",
+        )
+        .await;
+    }
+
     // Optional informational feeds for the TUI Activity panel. Best-effort:
     // they need extra scopes the operator may not have granted yet, so a
     // failure is logged and the bot keeps running.
@@ -397,6 +458,23 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                         text: message.message.text.clone(),
                     },
                 );
+                if let Some(zoom) = &ctx.zoom_user {
+                    let login = message.chatter_user_login.as_str();
+                    let name = message.chatter_user_name.as_str();
+                    // Once per live, persisted across restarts via the zoom
+                    // marker keyed on the current live id.
+                    if (login.eq_ignore_ascii_case(zoom) || name.eq_ignore_ascii_case(zoom))
+                        && claim_zoom(ctx).await
+                    {
+                        tracing::info!(user = %name, "zoom user speaking (first time this live)");
+                        emit(
+                            ctx,
+                            UiEvent::Notice {
+                                text: format!("Please zoom for {name}"),
+                            },
+                        );
+                    }
+                }
                 return chat::dispatch(
                     &message,
                     &chat::ChatDeps {
@@ -414,9 +492,161 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                 .await;
             }
         }
+        Event::StreamOnlineV1(payload) => {
+            if let EventMessage::Notification(n) = payload.message {
+                let key = format!("live:{}", n.id);
+                {
+                    let mut st = ctx.state.lock().await;
+                    if !st.note_message(&key) {
+                        tracing::debug!(key, "duplicate stream.online, skipping");
+                        return Ok(());
+                    }
+                    // Genuinely new live → record its id, re-arm the notice.
+                    st.start_live(&n.id);
+                }
+                notify_live(
+                    ctx,
+                    &n.id,
+                    n.broadcaster_user_login.as_str(),
+                    n.broadcaster_user_name.as_str(),
+                    None,
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
+        }
         other => emit_activity(ctx, other),
     }
     Ok(())
+}
+
+/// True if `marker_file` already records `stream_id` (already notified).
+async fn already_notified(marker: &std::path::Path, stream_id: &str) -> bool {
+    (tokio::fs::read_to_string(marker).await).is_ok_and(|c| c.trim() == stream_id)
+}
+
+/// Decide whether the "please zoom" notice fires now: once per live,
+/// persisted across restarts via the zoom marker keyed on the current live
+/// id. Falls back to an in-memory once-per-run guard when the live id is
+/// unknown (no `stream.online`/startup live-check this run).
+async fn claim_zoom(ctx: &EventSubContext) -> bool {
+    let live = ctx.state.lock().await.current_live.clone();
+    match (live, &ctx.zoom_marker) {
+        (Some(id), Some(marker)) => {
+            let path: &std::path::Path = marker;
+            if already_notified(path, &id).await {
+                return false;
+            }
+            if let Err(err) = tokio::fs::write(path, &id).await {
+                tracing::warn!(error = %err, "could not persist zoom marker");
+            }
+            true
+        }
+        _ => ctx.state.lock().await.claim_zoom_notice(),
+    }
+}
+
+/// Post the go-live webhook for `stream_id` unless it was already sent
+/// (persisted in the marker file). `title`/`category` are passed when known
+/// (startup path) and fetched from Helix otherwise (stream.online path).
+async fn notify_live(
+    ctx: &EventSubContext,
+    stream_id: &str,
+    login: &str,
+    name: &str,
+    title: Option<String>,
+    category: Option<String>,
+) {
+    let Some(d) = &ctx.discord else {
+        return;
+    };
+    if already_notified(d.marker_file.as_ref(), stream_id).await {
+        tracing::debug!(stream_id, "go-live already sent for this stream, skipping");
+        return;
+    }
+
+    let (mut title, category) = match (title, category) {
+        (Some(t), Some(c)) => (t, c),
+        _ => match ctx
+            .helix
+            .get_channel_from_id(&ctx.broadcaster_user_id, ctx.token.as_ref())
+            .await
+        {
+            Ok(Some(ch)) => (ch.title, ch.game_name.as_str().to_owned()),
+            Ok(None) => (String::new(), String::new()),
+            Err(err) => {
+                tracing::warn!(error = %err, "could not fetch channel info for go-live");
+                (String::new(), String::new())
+            }
+        },
+    };
+    if let Some(custom) = &d.live_title {
+        title = custom.as_str().to_owned();
+    }
+
+    let http = match reqwest::Client::builder().build() {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(error = %err, "go-live: HTTP client build failed");
+            return;
+        }
+    };
+    match crate::discord::notify_go_live(
+        &http,
+        &d.webhook_url,
+        &crate::discord::GoLive {
+            name,
+            login,
+            title: &title,
+            category: &category,
+        },
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::info!(broadcaster = %name, stream_id, "Discord go-live notification sent");
+            if let Err(err) = tokio::fs::write(d.marker_file.as_ref(), stream_id).await {
+                tracing::warn!(error = %err, "could not persist go-live marker (may re-notify)");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "Discord go-live notification failed (continuing)");
+        }
+    }
+}
+
+/// Startup path: if the channel is already live, notify once (guarded by
+/// the marker file). Covers launching homie mid-stream; when offline this
+/// is a no-op and `stream.online` handles the later transition.
+pub async fn notify_if_live_now(ctx: &EventSubContext) {
+    let Some(d) = &ctx.discord else {
+        return;
+    };
+    let login = d.broadcaster_login.as_str();
+    let logins = [login];
+    let req = GetStreamsRequest::user_logins(&logins);
+    match ctx.helix.req_get(req, ctx.token.as_ref()).await {
+        Ok(resp) => {
+            if let Some(s) = resp.data.into_iter().next() {
+                // Repopulate the live id after a restart so the persisted
+                // zoom marker stays once-per-live.
+                ctx.state.lock().await.start_live(s.id.as_str());
+                notify_live(
+                    ctx,
+                    s.id.as_str(),
+                    s.user_login.as_str(),
+                    s.user_name.as_str(),
+                    Some(s.title),
+                    Some(s.game_name),
+                )
+                .await;
+            } else {
+                tracing::info!("channel offline at startup; go-live will fire on stream.online");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "could not check live status at startup"),
+    }
 }
 
 /// Mirror sub/follow/raid notifications to the TUI Activity panel.
