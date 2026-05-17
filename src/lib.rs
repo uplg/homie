@@ -4,6 +4,7 @@ pub mod error;
 pub mod maison;
 pub mod obs;
 pub mod push_server;
+pub mod tui;
 pub mod twitch;
 pub mod yt_queue;
 

@@ -9,19 +9,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio_tungstenite::tungstenite::Message;
 use twitch_api::{
     HelixClient,
     eventsub::{
-        Event, EventsubWebsocketData, Message as EventMessage, Transport,
-        channel::{ChannelChatMessageV1, ChannelPointsCustomRewardRedemptionAddV1},
+        Event, EventSubscription, EventsubWebsocketData, Message as EventMessage, Transport,
+        channel::{
+            ChannelChatMessageV1, ChannelFollowV2, ChannelPointsCustomRewardRedemptionAddV1,
+            ChannelRaidV1, ChannelSubscribeV1, ChannelSubscriptionGiftV1,
+            ChannelSubscriptionMessageV1,
+        },
     },
     helix::eventsub::{
         CreateEventSubSubscriptionRequest, DeleteEventSubSubscriptionRequest,
         GetEventSubSubscriptionsRequest,
     },
-    types::UserId,
+    types::{SubscriptionTier, UserId},
 };
 use twitch_oauth2::UserToken;
 use url::Url;
@@ -31,6 +35,7 @@ use crate::{
     config::RewardsConfig,
     error::{Error, Result},
     maison::MaisonClient,
+    tui::UiEvent,
     twitch::chat,
     yt_queue::YtQueue,
 };
@@ -88,6 +93,27 @@ pub struct EventSubContext {
     pub discord_url: Option<Arc<String>>,
     pub melodie_url_file: Arc<PathBuf>,
     pub state: Arc<Mutex<EventSubState>>,
+    /// When `Some` (TUI mode), observable events are mirrored here for the
+    /// dashboard. `None` in headless mode — emission is then a no-op.
+    pub events: Option<broadcast::Sender<UiEvent>>,
+}
+
+/// Best-effort mirror of an observable event to the TUI. A slow/absent
+/// dashboard just means the event is dropped.
+fn emit(ctx: &EventSubContext, ev: UiEvent) {
+    if let Some(tx) = &ctx.events {
+        let _ = tx.send(ev);
+    }
+}
+
+fn tier_label(tier: &SubscriptionTier) -> String {
+    match tier {
+        SubscriptionTier::Tier1 => "T1".to_string(),
+        SubscriptionTier::Tier2 => "T2".to_string(),
+        SubscriptionTier::Tier3 => "T3".to_string(),
+        SubscriptionTier::Prime => "Prime".to_string(),
+        SubscriptionTier::Other(other) => other.clone(),
+    }
 }
 
 /// Run a single WebSocket session against `url` until the server closes
@@ -247,7 +273,7 @@ async fn create_subscriptions(ctx: &EventSubContext, session_id: &str) -> Result
     // Chat messages — bot listens as itself (token.user_id) on the broadcaster's channel.
     let body_chat = twitch_api::helix::eventsub::CreateEventSubSubscriptionBody::new(
         ChannelChatMessageV1::new(ctx.broadcaster_user_id.clone(), ctx.token.user_id.clone()),
-        transport,
+        transport.clone(),
     );
     ctx.helix
         .req_post(
@@ -259,7 +285,75 @@ async fn create_subscriptions(ctx: &EventSubContext, session_id: &str) -> Result
         .map_err(|err| Error::twitch(format!("create chat subscription: {err}")))?;
     tracing::info!("subscribed to channel.chat.message");
 
+    // Optional informational feeds for the TUI Activity panel. Best-effort:
+    // they need extra scopes the operator may not have granted yet, so a
+    // failure is logged and the bot keeps running.
+    if ctx.events.is_some() {
+        let bid = &ctx.broadcaster_user_id;
+        try_subscribe(
+            ctx,
+            &transport,
+            ChannelSubscribeV1::broadcaster_user_id(bid.clone()),
+            "channel.subscribe",
+        )
+        .await;
+        try_subscribe(
+            ctx,
+            &transport,
+            ChannelSubscriptionMessageV1::broadcaster_user_id(bid.clone()),
+            "channel.subscription.message",
+        )
+        .await;
+        try_subscribe(
+            ctx,
+            &transport,
+            ChannelSubscriptionGiftV1::broadcaster_user_id(bid.clone()),
+            "channel.subscription.gift",
+        )
+        .await;
+        try_subscribe(
+            ctx,
+            &transport,
+            ChannelFollowV2::new(bid.clone(), ctx.token.user_id.clone()),
+            "channel.follow",
+        )
+        .await;
+        try_subscribe(
+            ctx,
+            &transport,
+            ChannelRaidV1::to_broadcaster_user_id(bid.clone()),
+            "channel.raid",
+        )
+        .await;
+    }
+
     Ok(())
+}
+
+/// Create one best-effort `EventSub` subscription. Logs and swallows
+/// failures (typically a missing scope) so the bot is not aborted.
+async fn try_subscribe<S>(ctx: &EventSubContext, transport: &Transport, sub: S, name: &str)
+where
+    S: EventSubscription,
+{
+    let body =
+        twitch_api::helix::eventsub::CreateEventSubSubscriptionBody::new(sub, transport.clone());
+    match ctx
+        .helix
+        .req_post(
+            CreateEventSubSubscriptionRequest::default(),
+            body,
+            ctx.token.as_ref(),
+        )
+        .await
+    {
+        Ok(_) => tracing::info!(subscription = %name, "optional EventSub subscription created"),
+        Err(err) => tracing::warn!(
+            subscription = %name,
+            error = %err,
+            "optional EventSub subscription failed (missing scope? best-effort, continuing)"
+        ),
+    }
 }
 
 async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> {
@@ -275,6 +369,16 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                     tracing::debug!(key, "duplicate redemption, skipping");
                     return Ok(());
                 }
+                emit(
+                    ctx,
+                    UiEvent::Redemption {
+                        user: redemption.user_name.as_str().to_owned(),
+                        reward: redemption.reward.title.clone(),
+                        cost: redemption.reward.cost,
+                        input: (!redemption.user_input.is_empty())
+                            .then(|| redemption.user_input.clone()),
+                    },
+                );
                 return handle_redemption(ctx, &redemption).await;
             }
         }
@@ -285,6 +389,14 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                     tracing::debug!(key, "duplicate chat message, skipping");
                     return Ok(());
                 }
+                emit(
+                    ctx,
+                    UiEvent::Chat {
+                        user: message.chatter_user_name.as_str().to_owned(),
+                        privileged: chat::is_admin(&message.badges),
+                        text: message.message.text.clone(),
+                    },
+                );
                 return chat::dispatch(
                     &message,
                     &chat::ChatDeps {
@@ -302,9 +414,87 @@ async fn handle_notification(ctx: &EventSubContext, event: Event) -> Result<()> 
                 .await;
             }
         }
-        _ => {}
+        other => emit_activity(ctx, other),
     }
     Ok(())
+}
+
+/// Mirror sub/follow/raid notifications to the TUI Activity panel.
+/// Informational only: no dedup (a rare duplicate alert is harmless) and
+/// no bot side effects.
+fn emit_activity(ctx: &EventSubContext, event: Event) {
+    match event {
+        Event::ChannelSubscribeV1(payload) => {
+            if let EventMessage::Notification(n) = payload.message {
+                // Gift recipients also surface here with is_gift = true; the
+                // gift event already summarises them, so skip those.
+                if !n.is_gift {
+                    emit(
+                        ctx,
+                        UiEvent::Sub {
+                            user: n.user_name.as_str().to_owned(),
+                            tier: tier_label(&n.tier),
+                        },
+                    );
+                }
+            }
+        }
+        Event::ChannelSubscriptionMessageV1(payload) => {
+            if let EventMessage::Notification(n) = payload.message {
+                let msg = n.message.text.trim();
+                emit(
+                    ctx,
+                    UiEvent::Resub {
+                        user: n.user_name.as_str().to_owned(),
+                        tier: tier_label(&n.tier),
+                        months: n.cumulative_months,
+                        message: (!msg.is_empty()).then(|| msg.to_owned()),
+                    },
+                );
+            }
+        }
+        Event::ChannelSubscriptionGiftV1(payload) => {
+            if let EventMessage::Notification(n) = payload.message {
+                let gifter = if n.is_anonymous {
+                    "Anonymous".to_owned()
+                } else {
+                    n.user_name
+                        .as_ref()
+                        .map_or_else(|| "Anonymous".to_owned(), |d| d.as_str().to_owned())
+                };
+                emit(
+                    ctx,
+                    UiEvent::GiftSub {
+                        gifter,
+                        total: n.total,
+                        tier: tier_label(&n.tier),
+                    },
+                );
+            }
+        }
+        Event::ChannelFollowV2(payload) => {
+            if let EventMessage::Notification(n) = payload.message {
+                emit(
+                    ctx,
+                    UiEvent::Follow {
+                        user: n.user_name.as_str().to_owned(),
+                    },
+                );
+            }
+        }
+        Event::ChannelRaidV1(payload) => {
+            if let EventMessage::Notification(n) = payload.message {
+                emit(
+                    ctx,
+                    UiEvent::Raid {
+                        from: n.from_broadcaster_user_name.as_str().to_owned(),
+                        viewers: n.viewers,
+                    },
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn handle_redemption(

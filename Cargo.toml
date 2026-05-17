@@ -31,6 +31,9 @@ cpal = "0.17.1"
 yt-dlp = { git = "https://github.com/Guilherme-j10/yt-dlp", branch = "develop" }
 obws = { version = "0.15.0", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+# Optional terminal dashboard (HOMIE_TUI=1). ratatui re-exports its matching
+# crossterm at `ratatui::crossterm`, so we don't depend on crossterm directly.
+ratatui = "0.30"
 
 [dev-dependencies]
 wiremock = "0.6.5"

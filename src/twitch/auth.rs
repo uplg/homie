@@ -24,6 +24,13 @@ const TOKEN_FILE: &str = "token.json";
 const MIN_REMAINING_LIFETIME_SECS: u64 = 60;
 
 /// Scopes required by the bot.
+///
+/// `ChannelReadSubscriptions` and `ModeratorReadFollowers` only feed the
+/// optional TUI dashboard's Activity panel (sub/follow alerts). They are
+/// requested unconditionally so a single device-code authorisation covers
+/// every feature; the matching `EventSub` subscriptions are best-effort, so
+/// a token granted before these scopes were added keeps working (those
+/// alerts just won't appear until the operator re-authorises).
 #[must_use]
 pub fn required_scopes() -> Vec<Scope> {
     vec![
@@ -32,6 +39,8 @@ pub fn required_scopes() -> Vec<Scope> {
         Scope::UserWriteChat,
         Scope::UserBot,
         Scope::ChannelBot,
+        Scope::ChannelReadSubscriptions,
+        Scope::ModeratorReadFollowers,
     ]
 }
 
@@ -255,5 +264,8 @@ mod tests {
         assert!(scopes.contains(&Scope::ChannelReadRedemptions));
         assert!(scopes.contains(&Scope::UserReadChat));
         assert!(scopes.contains(&Scope::UserWriteChat));
+        // TUI Activity panel feeds (best-effort EventSub subscriptions).
+        assert!(scopes.contains(&Scope::ChannelReadSubscriptions));
+        assert!(scopes.contains(&Scope::ModeratorReadFollowers));
     }
 }
